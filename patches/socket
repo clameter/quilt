@@ -1,0 +1,422 @@
+Index: rdma-core/ib2roce/ib2roce.c
+===================================================================
+--- rdma-core.orig/ib2roce/ib2roce.c
++++ rdma-core/ib2roce/ib2roce.c
+@@ -61,6 +61,7 @@
+ #include <infiniband/verbs.h>
+ #include <poll.h>
+ #include <sys/mman.h>
++#include <sys/socket.h>
+ 
+ #include <linux/rtnetlink.h>
+ #include <net/ethernet.h>
+@@ -195,6 +196,10 @@ out:
+ 
+ const struct in_addr ip_none = { .s_addr = 0 };
+ 
++struct ibv_context sock_context = {
++	.device = NULL
++};
++
+ /*
+  * Handling of special Multicast Group MGID encodings on Infiniband
+  */
+@@ -247,8 +252,8 @@ static int cq_high = 0;	/* Largest batch
+ 
+ enum channel_type { channel_rdmacm, channel_ud, channel_qp1,
+ 	channel_raw, channel_ibraw,
+-	channel_packet, channel_incoming,
+-	channel_err, nr_channel_types };
++	channel_packet, channel_socket,
++	channel_incoming, channel_err, nr_channel_types };
+ 
+ struct buf;
+ 
+@@ -384,6 +389,7 @@ static inline void st(struct rdma_channe
+ static void add_event(unsigned long time_in_ms, void (*callback));
+ static struct rdma_unicast *new_rdma_unicast(struct i2r_interface *i, struct sockaddr_in *sin);
+ static void register_callback(void (*callback)(void *), int fd, void *private);
++static void handle_receive_raw_packet(void *private);
+ static void handle_receive_packet(void *private);
+ static void handle_comp_event(void *private);
+ static void handle_rdma_event(void *private);
+@@ -455,6 +461,54 @@ success:
+ 	return 1;
+ }
+ 
++
++static int check_net_device(enum interfaces i, char *name)
++{
++	int fh;
++	struct ifreq ifr;
++	char dev_name[40];
++	int p = 0;
++	char *s;
++
++	if (!name)
++		return 0;
++
++	/* Port / device specified */
++	s = strchr(name, ':');
++	if (s) {
++		/* Portnumber follows device name */
++		p = atoi(s + 1);
++
++		memcpy(dev_name, name, s-name);
++		dev_name[s-name] = 0;
++
++	} else
++		strcpy(dev_name, name);
++
++	fh = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
++	if (fh < 0)
++		goto out;
++
++	memcpy(ifr.ifr_name, dev_name, IFNAMSIZ);
++
++	if (ioctl(fh, SIOCGIFINDEX, &ifr) < 0)
++		goto out;
++
++	close(fh);
++
++	i2r[i].context = &sock_context;
++	i2r[i].port = p;
++	strcpy(i2r[i].if_name, dev_name);
++	i2r[i].rdma_name = i2r[i].if_name;
++	interfaces_text[i] = i2r[i].if_name;
++	return 1;
++
++out:
++	close(fh);
++	return 0;
++
++}
++
+ /* Scan through available RDMA devices in order to locate the devices for bridging */
+ static int find_rdma_devices(void)
+ {
+@@ -523,7 +577,8 @@ static int find_rdma_devices(void)
+ 	ibv_free_device_list(list);
+ 
+ 
+-	if (!i2r[ROCE].context) {
++	if (!i2r[ROCE].context && !check_net_device(ROCE, roce_name)) {
++
+ 
+ 		if (roce_name && roce_name[0] == '-')
+ 			/* Disabled on the command line */
+@@ -538,7 +593,7 @@ static int find_rdma_devices(void)
+ 		}
+ 	}
+ 
+-	if (!i2r[INFINIBAND].context) {
++	if (!i2r[INFINIBAND].context && !check_net_device(INFINIBAND, ib_name)) {
+ 
+ 		if ((ib_name && ib_name[0] == '-') && bridging)
+ 			/* Disabled on the command line */
+@@ -1034,7 +1089,7 @@ static void init_buf(void)
+ 
+ typedef bool setup_callback(struct rdma_channel *c);
+ static receive_callback receive_main, receive_multicast, receive_raw, receive_ud, receive_qp1;
+-static setup_callback setup_multicast, setup_channel, setup_raw, setup_packet, setup_incoming;
++static setup_callback setup_multicast, setup_channel, setup_raw, setup_packet, setup_mcsocket, setup_incoming;
+ 
+ #define NO_CORE (-1)
+ /*
+@@ -1055,12 +1110,13 @@ struct channel_info {
+ 	enum channel_type fallback;
+ 
+ } channel_infos[nr_channel_types] = {
+-	{ "multicast",	0, 0,	true,	10,	20,	0,		IBV_QPT_UD,		setup_multicast, receive_multicast, channel_err },
++	{ "multicast",	0, 0,	true,	10,	20,	0,		IBV_QPT_UD,		setup_multicast, receive_multicast, channel_socket },
+ 	{ "ud",		1, 1,	true,	100,	200,	RDMA_UDP_QKEY,	IBV_QPT_UD,		setup_channel,	receive_ud,	channel_err }, 
+ 	{ "qp1",	2, 1,	false, 	10,	5,	IB_DEFAULT_QP1_QKEY, IBV_QPT_UD,	setup_channel,	receive_qp1,	channel_err },
+ 	{ "raw",	3, 1,	false,	1000, 	5,	0x12345,	IBV_QPT_RAW_PACKET,	setup_raw,	receive_raw,	channel_packet },
+ 	{ "ibraw",	3, 1,	false,	1000,	5,	0x12345,	IBV_QPT_UD,		setup_raw,	receive_raw,	channel_packet },
+ 	{ "packet",	-1, -1,	false,	0,	0,	0,		0,			setup_packet,	receive_raw,	channel_err },
++	{ "socket",	-1, -1,	false,	0,	0,	0,		0,			setup_mcsocket,	receive_multicast, channel_err },
+ 	{ "incoming",	-1, -1,	false,	100,	50,	0,		0,			setup_incoming,	receive_main,	channel_err },
+ 	{ "error",	-1, -1,	false,	0,	0,	0,		0,			NULL,		NULL,		channel_err },
+ };
+@@ -1924,6 +1980,36 @@ static bool setup_packet(struct rdma_cha
+ 	}
+ 
+ 	c->fh = fh;
++	register_callback(handle_receive_raw_packet, fh, c);
++	return true;
++}
++
++static bool setup_mcsocket(struct rdma_channel *c)
++{
++	struct i2r_interface *i = c->i;
++	int fh;
++	int flag0 = false;
++	int yes = true;
++	struct sockaddr_in sin = i->if_addr;
++
++	fh = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
++	if (fh < 0) {
++		logg(LOG_ERR, "Multicast Socket creation failed for %s:%s\n", i->text, errname());
++		return false;
++	}
++
++	sin.sin_port = 0;
++
++	if (bind(fh, (struct sockaddr *)&sin, sizeof(struct sockaddr_in))) {
++		logg(LOG_ERR, "Cannot bind multicast socket for %s:%s\n", i->text, errname());
++		return NULL;
++	}
++	
++	setsockopt(fh, SOL_IP, IP_MULTICAST_ALL, &flag0, sizeof(flag0));
++	setsockopt(fh, SOL_IP, IP_MULTICAST_LOOP, &flag0, sizeof(flag0));
++	setsockopt(fh, IPPROTO_IP, IP_PKTINFO, &yes, sizeof(yes));
++
++	c->fh = fh;
+ 	register_callback(handle_receive_packet, fh, c);
+ 	return true;
+ }
+@@ -1957,6 +2043,7 @@ static void setup_interface(enum interfa
+ 	struct i2r_interface *i = i2r + in;
+ 	struct ibv_gid_entry *e;
+ 	char buf[INET6_ADDRSTRLEN];
++	enum channel_type type;
+ 
+ 	if (in == INFINIBAND)
+ 		i->maclen = 20;
+@@ -1966,42 +2053,50 @@ static void setup_interface(enum interfa
+ 	if (!i->context)
+ 		return;
+ 
++	if (i->context == &sock_context)
++		type = channel_socket;
++	else
++		type = channel_rdmacm;
++
+ 	i->text = interfaces_text[in];
+ 
+-	/* Determine the GID */
+-	i->iges = ibv_query_gid_table(i->context, i->ige, MAX_GID, 0);
++	if (type == channel_rdmacm) {
++		/* Determine the GID */
++		i->iges = ibv_query_gid_table(i->context, i->ige, MAX_GID, 0);
++
++		if (i->iges <= 0) {
++			logg(LOG_CRIT, "Error %s. Failed to obtain GID table for %s\n",
++				errname(), i->text);
++			abort();
++		}
+ 
+-	if (i->iges <= 0) {
+-		logg(LOG_CRIT, "Error %s. Failed to obtain GID table for %s\n",
+-			errname(), i->text);
+-		abort();
+-	}
++		/* Find the correct gid entry */
++		for (e = i->ige; e < i->ige + i->iges; e++) {
++	
++			if (e->port_num != i->port)
++				continue;
+ 
+-	/* Find the correct gid entry */
+-	for (e = i->ige; e < i->ige + i->iges; e++) {
++			if (in == INFINIBAND && e->gid_type == IBV_GID_TYPE_IB)
++				break;
+ 
+-		if (e->port_num != i->port)
+-			continue;
++			if (in == ROCE && e->gid_type == IBV_GID_TYPE_ROCE_V2 &&
++					e->gid.global.subnet_prefix == 0)
++				break;
++		}
+ 
+-		if (in == INFINIBAND && e->gid_type == IBV_GID_TYPE_IB)
+-			break;
++		if (e >= i->ige + i->iges) {
++			logg(LOG_CRIT, "Failed to find GIDs in GID table for %s\n",
++				i->text);
++			abort();
++		}
+ 
+-		if (in == ROCE && e->gid_type == IBV_GID_TYPE_ROCE_V2 &&
+-				e->gid.global.subnet_prefix == 0)
+-			break;
+-	}
++		/* Copy our connection info from GID table */
++		i->gid = e->gid;
++		i->gid_index = e->gid_index;
++		i->ifindex = e->ndev_ifindex;
+ 
+-	if (e >= i->ige + i->iges) {
+-		logg(LOG_CRIT, "Failed to find GIDs in GID table for %s\n",
+-			i->text);
+-		abort();
+ 	}
+ 
+-	/* Copy our connection info from GID table */
+-	i->gid = e->gid;
+-	i->gid_index = e->gid_index;
+-	i->ifindex = e->ndev_ifindex;
+-
+ 	/* Get more info about the IP network attached to the RDMA device */
+ 	get_if_info(i);
+ 
+@@ -2014,35 +2109,35 @@ static void setup_interface(enum interfa
+ 	else
+ 		i->ep = i->ip_to_ep;;
+ 
++	if (type == channel_rdmacm) {
+ 
+-	/* Create RDMA elements that are interface wide */
+-
+-	i->rdma_events = rdma_create_event_channel();
+-	if (!i->rdma_events) {
+-		logg(LOG_CRIT, "rdma_create_event_channel() for %s failed (%s).\n",
+-			i->text, errname());
+-		abort();
+-	}
+-	register_callback(handle_rdma_event, i->rdma_events->fd, i);
++		i->rdma_events = rdma_create_event_channel();
++		if (!i->rdma_events) {
++			logg(LOG_CRIT, "rdma_create_event_channel() for %s failed (%s).\n",
++				i->text, errname());
++			abort();
++		}
++		register_callback(handle_rdma_event, i->rdma_events->fd, i);
+ 
+-	i->pd = ibv_alloc_pd(i->context);
+-	if (!i->pd) {
+-		logg(LOG_CRIT, "ibv_alloc_pd failed for %s.\n", i->text);
+-		abort();
+-	}
++		i->pd = ibv_alloc_pd(i->context);
++		if (!i->pd) {
++			logg(LOG_CRIT, "ibv_alloc_pd failed for %s.\n", i->text);
++			abort();
++		}
+ 
+-	i->comp_events = ibv_create_comp_channel(i->context);
+-	if (!i->comp_events) {
+-		logg(LOG_CRIT, "ibv_create_comp_channel failed for %s : %s.\n",
+-			i->text, errname());
+-		abort();
+-	}
+-	register_callback(handle_comp_event, i->comp_events->fd, i->comp_events);
++		i->comp_events = ibv_create_comp_channel(i->context);
++		if (!i->comp_events) {
++			logg(LOG_CRIT, "ibv_create_comp_channel failed for %s : %s.\n",
++				i->text, errname());
++			abort();
++		}
++		register_callback(handle_comp_event, i->comp_events->fd, i->comp_events);
+ 
+-	i->mr = ibv_reg_mr(i->pd, buffers, nr_buffers * sizeof(struct buf), IBV_ACCESS_LOCAL_WRITE);
+-	if (!i->mr) {
+-		logg(LOG_CRIT, "ibv_reg_mr failed for %s:%s.\n", i->text, errname());
+-		abort();
++		i->mr = ibv_reg_mr(i->pd, buffers, nr_buffers * sizeof(struct buf), IBV_ACCESS_LOCAL_WRITE);
++		if (!i->mr) {
++			logg(LOG_CRIT, "ibv_reg_mr failed for %s:%s.\n", i->text, errname());
++			abort();
++		}
+ 	}
+ 
+ 	i->multicast = new_rdma_channel(i, channel_rdmacm);
+@@ -2552,6 +2647,21 @@ static int send_to(struct rdma_channel *
+ 	struct ibv_sge sge;
+ 	int ret;
+ 
++	if (c->type == channel_socket) {
++		struct sockaddr_in sin = {
++			.sin_family = AF_INET,
++			.sin_addr = d->ep->addr,
++			.sin_port = htons(d->remote_qpn)
++		};
++
++		ret = sendto(c->fh, buf->cur, buf->end - buf->cur, 0, &sin, sizeof(sin));
++
++		if (ret < 0)
++			logg(LOG_ERR, "%s: Multicast Packet send error\n", c->text);
++
++		return ret;
++	}
++
+ 	if (!d->ep->ah)
+ 		abort();	/* Send without a route */
+ 
+@@ -4512,11 +4622,75 @@ static void handle_comp_event(void *priv
+ 		process_cqes(c, wc, cqs);
+ }
+ 
+-/* Special handling using raw socket */
++/* Receive Multicast on regular socket */
+ static void handle_receive_packet(void *private)
+ {
+ 	struct rdma_channel *c = private;
+ 	struct ibv_wc w = {};
++	ssize_t len;
++	struct buf *buf = alloc_buffer(c);
++	struct sockaddr_in sin;
++	struct iovec iov = {
++		.iov_base = buf->raw,
++		.iov_len = DATA_SIZE
++	};
++	struct msghdr control = { };
++	struct msghdr msg = {
++		.msg_name = &sin,
++		.msg_namelen = sizeof(sin),
++		.msg_iov = &iov,
++		.msg_iovlen = 1,
++		.msg_control = &control,
++		.msg_controllen = sizeof(control),
++	};
++	struct cmsghdr *cmsg;
++
++ 	len = recvmsg(c->fh, &msg, 0);
++
++	if (len < 0) {
++		logg(LOG_ERR, "recv error on %s:%s\n", c->text, errname());
++		free(buf);
++		return;
++	}
++
++	if (len < 10) {
++		logg(LOG_ERR, "Packet size below minimal %ld\n", len);
++		return;
++	}
++		
++	st(c, packets_received);
++
++	w.byte_len = len;
++	buf->cur = buf->raw;
++	buf->end = buf->raw + w.byte_len;
++	buf->w = &w;
++	reset_flags(buf);
++
++	for(cmsg = CMSG_FIRSTHDR(&control); cmsg != NULL; cmsg = CMSG_NXTHDR(&control, cmsg)) {
++		if (cmsg->cmsg_level == IPPROTO_IP && cmsg->cmsg_type == IP_PKTINFO) {
++			struct in_pktinfo *in = (void *)CMSG_DATA(cmsg);
++
++			buf->ip_valid = true;
++			memset(&buf->ip, 0, sizeof(buf->ip));
++			buf->ip.daddr = in->ipi_addr.s_addr;
++			buf->ip.saddr = sin.sin_addr.s_addr;
++			buf->ip.tot_len = len;
++		}
++	}
++
++	if (!buf->ip_valid) {
++		logg(LOG_ERR, "%s: Cannot determine source and destination address of message\n", c->text);
++		free(buf);
++		return;
++	}
++	c->receive(buf);
++}
++
++/* Special handling using raw socket */
++static void handle_receive_raw_packet(void *private)
++{
++	struct rdma_channel *c = private;
++	struct ibv_wc w = {};
+ 	unsigned ethertype;
+ 	ssize_t len;
+ 	struct buf *buf = alloc_buffer(c);

@@ -1,0 +1,67 @@
+Index: rdma-core/ib2roce/ib2roce.c
+===================================================================
+--- rdma-core.orig/ib2roce/ib2roce.c
++++ rdma-core/ib2roce/ib2roce.c
+@@ -50,7 +50,7 @@
+ #include <ctype.h>
+ #include <pthread.h>
+ #include <numa.h>
+-
++#include <stdatomic.h>
+ #include <arpa/inet.h>
+ #include <sys/socket.h>
+ #include <netdb.h>
+@@ -848,7 +848,7 @@ struct buf {
+ 		struct {
+ 			struct buf *next;	/* Next free buffer */
+ 			bool free;
+-			unsigned refcount;	/* Refcount */
++			atomic_uint refcount;	/* Refcount */
+ 			struct rdma_channel *c;	/* Which Channels does this buffer belong to */
+ 			struct ibv_wc *w;	/* Work Completion struct */
+ 			struct endpoint *source_ep;
+@@ -912,26 +912,23 @@ static void free_buffer(struct buf *buf)
+ 
+ static void get_buf(struct buf *buf)
+ {
+-	lock();
+-	if (!buf->refcount)
++	unsigned x;
++
++	x = atomic_fetch_add(&buf->refcount, 1);
++	if (!x)
++		/* Incrementing the refcount from 0 ??? */
+ 		abort();
+-	buf->refcount++;
+-	unlock();
+ }
+ 
+ static void put_buf(struct buf *buf)
+ {
+-	unsigned count;
++	unsigned x;
+ 
+-	lock();
+-	count = --buf->refcount;
+-	if (count) {
+-		unlock();
++	x = atomic_fetch_sub(&buf->refcount, 1);
++	if (x)
+ 		return;
+-	}
+ 
+-	__free_buffer(buf);
+-	unlock();
++	free_buffer(buf);
+ }
+ 
+ /* Remove all buffers related to a channel */
+@@ -4061,7 +4058,7 @@ static void process_cqes(struct rdma_cha
+ 
+ 			buf->ip_csum_ok = (w->wc_flags & IBV_WC_IP_CSUM_OK) != 0;
+ 
+-			buf->refcount = 1;
++			atomic_store(&buf->refcount, 1);
+ 			c->receive(buf);
+ 			put_buf(buf);
+ 

@@ -1,0 +1,72 @@
+Index: rdma-core/ib2roce/ib2roce.c
+===================================================================
+--- rdma-core.orig/ib2roce/ib2roce.c
++++ rdma-core/ib2roce/ib2roce.c
+@@ -1002,17 +1002,17 @@ static char *pgm_dump(struct pgm_header
+ /*
+  * Handling of RDMA work requests
+  */
+-static int post_receive(struct rdma_channel *c, int limit)
++static void post_receive(struct rdma_channel *c)
+ {
+ 	struct ibv_recv_wr recv_wr, *recv_failure;
+ 	struct ibv_sge sge;
+ 	int ret = 0;
+ 
+-	if (!nextbuffer)
+-		return -ENOMEM;
++	if (!c || !nextbuffer)
++		return;
+ 
+-	if (c->active_receive_buffers >= limit)
+-		return 0;
++	if (c->active_receive_buffers >= c->max_receive_buffers)
++		return;
+ 
+ 	recv_wr.next = NULL;
+ 	recv_wr.sg_list = &sge;
+@@ -1037,38 +1037,18 @@ static int post_receive(struct rdma_chan
+ 		if (ret) {
+ 			free_buffer(buf);
+ 			logg(LOG_WARNING, "ibv_post_recv failed: %s:%s\n", c->text, errname());
+-			break;
++			return;
+                 }
+ 		c->active_receive_buffers++;
+ 	}
+-	return ret;
+ }
+ 
+-static int post_receive_buffers(struct i2r_interface *i)
++static void post_receive_buffers(struct i2r_interface *i)
+ {
+-	int ret = 0;
+-
+-	if (!nextbuffer)
+-		return -EAGAIN;
+-
+-	ret = post_receive(i->multicast, i->multicast->nr_cq / 2);
+-	if (ret)
+-		goto out;
+-
+-	if (i->raw && i->raw->type == channel_raw)
+-		ret = post_receive(i->raw, 100);
+-
+-	if (ret)
+-		goto out;
+-
+-	if (i->qp1)
+-		ret = post_receive(i->qp1, 10);
+-
+-	if (i->ud)
+-		ret = post_receive(i->ud, 100);
+-
+-out:
+-	return ret;
++	post_receive(i->multicast);
++	post_receive(i->raw);
++	post_receive(i->qp1);
++	post_receive(i->ud);
+ }
+ 
+ 

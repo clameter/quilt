@@ -1,0 +1,24 @@
+Index: rdma-core/ib2roce/ib2roce.c
+===================================================================
+--- rdma-core.orig/ib2roce/ib2roce.c
++++ rdma-core/ib2roce/ib2roce.c
+@@ -3028,9 +3028,6 @@ static const char *sidr_req(struct buf *
+ 		hash_del(sidrs, &sr->request_id);
+ 	}
+ 
+-	if (find_forward(source_ep, 0))
+-		return "Ignoring SIDR REQ since one is already pending from the endpoint";
+-
+ 	if (bridging) {
+ 		struct sidr_state *ss = malloc(sizeof(struct sidr_state));
+ 
+@@ -3091,6 +3088,9 @@ static const char * sidr_rep(struct buf
+ 	if (ss->dest != buf->source_ep)
+ 		abort();
+ 
++	if (find_forward(buf->source_ep, 0))
++		return "Ignoring SIDR REQ since one is already pending from the endpoint";
++
+ 	add_forward(ss->source, 0, ss->dest, sr_qpn, sr_qkey);
+ 
+ 	qpn_word = (ss->source->c->i->ud->qp->qp_num << 8) | (qpn_word & 0xff);

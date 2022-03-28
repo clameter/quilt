@@ -1,0 +1,193 @@
+Index: rdma-core/ib2roce/ib2roce.c
+===================================================================
+--- rdma-core.orig/ib2roce/ib2roce.c
++++ rdma-core/ib2roce/ib2roce.c
+@@ -2391,43 +2391,53 @@ err:
+ 	resolve_end(ru);
+ }
+ 
+-/*
+- * Do not use a buffer but simply include data directly into WR.
+- * Advantage: No buffer used and therefore faster since no memory
+- * fetch has to be done by the RDMA subsystem and no completion
+- * event has to be handled.
+- *
+- * Space in the WR is limited, so it only works for very small packets.
+- */
+-static int send_inline(struct rdma_channel *c, void *addr, unsigned len, struct ah_info *ai, bool imm_used, unsigned imm)
++static int qp_send(struct ibv_qp *qp, void *addr, unsigned len,
++	uint32_t lkey, struct ibv_ah *ah, uint32_t remote_qpn, uint32_t remote_qkey,
++	bool imm_used, unsigned imm, unsigned wr_id)
+ {
+ 	struct ibv_sge sge = {
+ 		.length = len,
+-		.addr = (uint64_t)addr
++		.addr = (uint64_t)addr,
++		.lkey = lkey
+ 	};
+ 	struct ibv_send_wr wr = {
+ 		.sg_list = &sge,
+ 		.num_sge = 1,
+ 		.opcode = imm_used ? IBV_WR_SEND_WITH_IMM : IBV_WR_SEND,
+-		.send_flags = IBV_SEND_INLINE,
++		.send_flags = len < MAX_INLINE_DATA ? IBV_SEND_INLINE: IBV_SEND_SIGNALED,,
+ 		.imm_data = imm,
+ 		.wr = {
+ 			/* Get addr info  */
+ 			.ud = {
+-				.ah = ai->ah,
+-				.remote_qpn = ai->remote_qpn,
+-				.remote_qkey = ai->remote_qkey
++				.ah = ah,
++				.remote_qpn = remote_qpn,
++				.remote_qkey = remote_qkey
+ 			}
+-		}
++		},
++		.wr_id = wr_id,
++		.sg_list = &sge,
+ 
+ 	};
+ 	struct ibv_send_wr *bad_send_wr;
++
++	return ibv_post_send(c->qp, &wr, &bad_send_wr);
++}
++/*
++ * Do not use a buffer but simply include data directly into WR.
++ * Advantage: No buffer used and therefore faster since no memory
++ * fetch has to be done by the RDMA subsystem and no completion
++ * event has to be handled.
++ *
++ * Space in the WR is limited, so it only works for very small packets.
++ */
++static int send_inline(struct rdma_channel *c, void *addr, unsigned len, struct ah_info *ai, bool imm_used, unsigned imm)
++{
+ 	int ret;
+ 
+ 	if (len > MAX_INLINE_DATA)
+ 		return -E2BIG;
+ 
+-	ret = ibv_post_send(c->qp, &wr, &bad_send_wr);
++	ret = qp_send(c->qp, addrd, len, 0, ai->ah, ai->remote_qpn, ai->remote_qkey, imm_used, imm, 0);
+ 	if (ret) {
+ 		errno = -ret;
+ 		logg(LOG_WARNING, "Failed to post inline send: %s on %s\n", errname(), c->text);
+@@ -2440,100 +2450,48 @@ static int send_inline(struct rdma_chann
+ }
+ 
+ /*
+- * Send data to target using native RDMA structs. This one does not support RDMACM since
+- * it uses the shared i->mr and not the c->mr required by rdma cm..
++ * Send data to a target. No metadata is used from struct buf. However, the buffer must be passed to the wc in order
++ * to be able to free up resources when done.
+  */
+-static int send_ud(struct rdma_channel *c, struct buf *buf, struct ibv_ah *ah, uint32_t remote_qpn, uint32_t qkey)
++static int send_to(struct rdma_channel *c,
++	void *addr, unsigned len, struct ah_info *ai,
++	bool imm_used, unsigned imm,
++	struct buf *buf)
+ {
+-	struct ibv_send_wr wr, *bad_send_wr;
+-	struct ibv_sge sge;
+ 	int ret;
+-	unsigned len = buf->end - buf->cur;
+ 
+ 	buf->c = c;	/* Change ownership to sending channel */
+ 	buf->w = NULL;
+ 
+-	memset(&wr, 0, sizeof(wr));
+-	wr.sg_list = &sge;
+-	wr.num_sge = 1;
+-	wr.opcode = buf->imm_valid ? IBV_WR_SEND_WITH_IMM : IBV_WR_SEND;
+-	wr.imm_data = buf->imm;
+-	wr.send_flags = IBV_SEND_SIGNALED;
+-	wr.wr_id = (uint64_t)buf;
+-
+-	/* Get addr info  */
+-	wr.wr.ud.ah = ah;
+-	wr.wr.ud.remote_qpn = remote_qpn;
+-	wr.wr.ud.remote_qkey = qkey;
+-
+-	sge.length = buf->end - buf->cur;
+-	sge.lkey = c->i->mr->lkey;
+-	sge.addr = (uint64_t)buf->cur;
+-
+-	if (len <= MAX_INLINE_DATA) {
+-		wr.send_flags = IBV_SEND_INLINE;
+-		ret = ibv_post_send(c->qp, &wr, &bad_send_wr);
+-		free_buffer(buf);
+-	} else
+-		ret = ibv_post_send(c->qp, &wr, &bad_send_wr);
++	ret = qp_send(c->qp, addr, len, c->mr->lkey, ai->ah, ai->remote_qpn, ai->remote->qkey, imm_used, imm, buf);
+ 
+ 	if (ret) {
+-		errno = ret;
++		errno = - ret;
+ 		logg(LOG_WARNING, "Failed to post send: %s on %s\n", errname(), c->text);
+-		stop_channel(c);
+-	} else
+-		if (log_packets > 1)
+-			logg(LOG_NOTICE, "RDMA Send to QPN=%x QKEY=%x %d bytes\n",
+-				wr.wr.ud.remote_qpn, wr.wr.ud.remote_qkey, len);
+-
++	}
+ 	return ret;
+ }
+ 
+ /*
+- * Send data to a target. No metadata is used in struct buf. However, the buffer must be passed to the wc in order
+- * to be able to free up resources when done.
++ * Send buffer to a target. Rely on state in struct buf passed to the function
+  */
+-static int send_to(struct rdma_channel *c,
+-	void *addr, unsigned len, struct ah_info *ai,
+-	bool imm_used, unsigned imm,
+-	struct buf *buf)
++static int send_ud(struct rdma_channel *c, struct buf *buf, struct ibv_ah *ah, uint32_t remote_qpn, uint32_t qkey)
+ {
+-	struct ibv_send_wr wr, *bad_send_wr;
+-	struct ibv_sge sge;
+ 	int ret;
+-
+-	if (!ai->ah)
+-		abort();	/* Send without a route */
++	unsigned len = buf->end - buf->cur;
+ 
+ 	buf->c = c;	/* Change ownership to sending channel */
+ 	buf->w = NULL;
++	ret = qp_send(c->qp, buf->cur, len , len  < MAX_INLINE_DATA ? 0 : c->mr->lkey, ai->ah, ai->remote_qpn, ai->remote_qkey, buf->imm_valid, buf->imm, buf);
+ 
+-	memset(&wr, 0, sizeof(wr));
+-	wr.sg_list = &sge;
+-	wr.num_sge = 1;
+-	wr.opcode = imm_used ? IBV_WR_SEND_WITH_IMM: IBV_WR_SEND;
+-	wr.send_flags = IBV_SEND_SIGNALED;
+-	wr.wr_id = (uint64_t)buf;
+-	wr.imm_data = imm;
+-
+-	/* Get addr info  */
+-	wr.wr.ud.ah = ai->ah;
+-	wr.wr.ud.remote_qpn = ai->remote_qpn;
+-	wr.wr.ud.remote_qkey = ai->remote_qkey;
+-
+-	sge.length = len;
+-	sge.lkey = c->mr->lkey;
+-	sge.addr = (uint64_t)addr;
++	if (len < MAX_INLINE_DATA)
++		free_buffer(buf);
+ 
+-	ret = ibv_post_send(c->qp, &wr, &bad_send_wr);
+ 	if (ret) {
+-		errno = - ret;
++		errno = ret;
+ 		logg(LOG_WARNING, "Failed to post send: %s on %s\n", errname(), c->text);
+-	} else
+-		if (log_packets > 1)
+-			logg(LOG_NOTICE, "RDMA Send to QPN=%x QKEY=%x %d bytes\n",
+-				wr.wr.ud.remote_qpn, wr.wr.ud.remote_qkey, len);
+-
++		stop_channel(c);
++	}
+ 	return ret;
+ }
+ 

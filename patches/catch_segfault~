@@ -1,0 +1,38 @@
+Index: rdma-core/ib2roce/ib2roce.c
+===================================================================
+--- rdma-core.orig/ib2roce/ib2roce.c
++++ rdma-core/ib2roce/ib2roce.c
+@@ -843,7 +843,7 @@ static void init_buf(void)
+ 		abort();
+ 	}
+ 
+-	flags = MAP_PRIVATE | MAP_ANONYMOUS;
++	flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE;
+ 	if (huge)
+ 		flags |= MAP_HUGETLB;
+ 
+@@ -1492,6 +1492,7 @@ static struct rdma_channel *create_raw_c
+ 
+ 			/* Install abort handler so that we can be sure that the capture mode is switched off */
+ 			signal(SIGABRT, &shutdown_sniffer);
++			signal(SIGSEGV, &shutdown_sniffer);
+ 		}
+ 	}
+ #endif
+@@ -4509,7 +4510,7 @@ int main(int argc, char **argv)
+ 
+ 	sidr_state_init();
+ 
+-	while ((op = getopt_long(argc, argv, "ab::c:d:fhi:l::m:no:p:r:tuvxyz:",
++	while ((op = getopt_long(argc, argv, "ab::c:d:fhi:l::m:no:p:i:tuvxyz:",
+ 					opts, NULL)) != -1)
+ 		exec_opt(op, optarg);
+ 
+@@ -4554,6 +4555,7 @@ int main(int argc, char **argv)
+ 	if (background)
+ 		close(status_fd);
+ 
++	logging();
+ 	shutdown_roce();
+ 	shutdown_ib();
+ 

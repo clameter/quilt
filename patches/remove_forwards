@@ -1,0 +1,36 @@
+Index: rdma-core/ib2roce/ib2roce.c
+===================================================================
+--- rdma-core.orig/ib2roce/ib2roce.c
++++ rdma-core/ib2roce/ib2roce.c
+@@ -2264,12 +2264,31 @@ static bool remove_forward(struct endpoi
+ 		} else {
+ 			source->forwards = f->next;
+ 		}
++		free(f);
+ 		return true;
+ 	} else
+ 		return false;
+ }
+ 
+ /*
++ * Remove all forwards of an endpoint and indicate how many
++ * were removed.
++ */
++static unsigned int remove_forwards(struct endpoint *source)
++{
++	unsigned int n = 0;
++
++	while (source->forwards) {
++		struct forward *f = source->forwards;
++
++		source->forwards = f->next;
++		free(f);
++		n++;
++	}
++	return n;
++}
++
++/*
+  * Update the forwarder if the source point changes
+  */
+ static struct forward *update_forward(struct endpoint *source, unsigned old_source_qp, unsigned new_source_qp)

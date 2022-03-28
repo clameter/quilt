@@ -1,0 +1,239 @@
+Index: rdma-core/ib2roce/ib2roce.c
+===================================================================
+--- rdma-core.orig/ib2roce/ib2roce.c
++++ rdma-core/ib2roce/ib2roce.c
+@@ -437,6 +437,17 @@ static int find_rdma_devices(void)
+ 
+ 	if (!i2r[INFINIBAND].context) {
+ 
++		if (ib_name && isdigit(ib_name[0])) {
++			struct i2r_interface *i = i2r + INFINIBAND;
++
++			i2r[i].context = NULL;
++			strncpy(i2r[i].if_name, ib_name, IFNAMSIZ);
++			get_if_info(i);
++			i2r[i].port = i->ifindex;
++			logg(LOG_NOTICE, "Using Socket API instead of Infiniband\n");
++			return 0;
++		}
++
+ 		if ((ib_name && ib_name[0] == '-') && bridging)
+ 			/* Disabled on the command line */
+ 			bridging = false;
+@@ -1118,9 +1129,11 @@ static void get_if_info(struct i2r_inter
+ 	 */
+ 	if (!i->ifindex && i - i2r == INFINIBAND) {
+ 
+-		logg(LOG_WARNING, "Assuming ib0 is the IP device name for %s\n",
+-		     ibv_get_device_name(i->context->device));
+-		strcpy(i->if_name, "ib0");
++		if (i->if_name[0] == 0) {
++			logg(LOG_WARNING, "Assuming ib0 is the IP device name for %s\n",
++			     ibv_get_device_name(i->context->device));
++			strcpy(i->if_name, "ib0");
++		}
+ 
+ 		memcpy(ifr.ifr_name, i->if_name, IFNAMSIZ);
+ 
+@@ -1152,6 +1165,8 @@ static void get_if_info(struct i2r_inter
+ 	memcpy(&i->if_netmask, &ifr.ifr_netmask, sizeof(struct sockaddr_in));
+ 	ioctl(fh, SIOCGIFHWADDR, &ifr);
+ 	memcpy(&i->if_mac, &ifr.ifr_hwaddr.sa_data, ETH_ALEN);
++	ioctl(fh, SIOCGIFMTU, &ifr);
++	i->mtu = i->ifr_mtu;
+ 	goto out;
+ 
+ err:
+@@ -1458,69 +1473,84 @@ static void setup_interface(enum interfa
+ 	struct ibv_gid_entry *e;
+ 	char buf[INET6_ADDRSTRLEN];
+ 	struct sockaddr_in *sin;
++	bool socket = !i->context && i->port;
+ 
+-	if (in == INFINIBAND)
++	i->maclen = 6;
++
++	if (in == INFINIBAND && !socket)
+ 		i->maclen = 20;
+-	else
+-		i->maclen = 6;
+ 
+-	if (!i->context)
++	if (!i->context && !i->port)
+ 		return;
+ 
+-	i->text = interfaces_text[in];
++	sin = calloc(1, sizeof(struct sockaddr_in));
++	sin->sin_family = AF_INET;
++	sin->sin_addr = i->if_addr.sin_addr;
++	sin->sin_port = htons(default_port);
+ 
+-	/* Determine the GID */
+-	i->iges = ibv_query_gid_table(i->context, i->ige, MAX_GID, 0);
++	i->ru_hash = hash_create(offsetof(struct rdma_unicast, sin), sizeof(struct sockaddr_in));
++	i->ip_to_ep = hash_create(offsetof(struct endpoint, addr), sizeof(struct in_addr));
++	
+ 
+-	if (i->iges <= 0) {
+-		logg(LOG_CRIT, "Error %s. Failed to obtain GID table for %s\n",
+-			errname(), i->text);
+-		abort();
+-	}
++	if (socket) {
+ 
+-	/* Find the correct gid entry */
+-	for (e = i->ige; e < i->ige + i->iges; e++) {
++		i->text = "SOCKET";
++		i->multicast = create_multicast_socket(i);
++		i->raw = create_packet_socket(i, i->ifindex);
++		i->ep = i->ip_to_ep;
+ 
+-		if (e->port_num != i->port)
+-			continue;
++		goto out;
+ 
+-		if (in == INFINIBAND && e->gid_type == IBV_GID_TYPE_IB)
+-			break;
++	} else {
++		i->text = interfaces_text[in];
+ 
+-		if (in == ROCE && e->gid_type == IBV_GID_TYPE_ROCE_V2 &&
+-				e->gid.global.subnet_prefix == 0)
+-			break;
+-	}
++		/* Determine the GID */
++		i->iges = ibv_query_gid_table(i->context, i->ige, MAX_GID, 0);
++	
++		if (i->iges <= 0) {
++			logg(LOG_CRIT, "Error %s. Failed to obtain GID table for %s\n",
++				errname(), i->text);
++			abort();
++		}
+ 
+-	if (e >= i->ige + i->iges) {
+-		logg(LOG_CRIT, "Failed to find GIDs in GID table for %s\n",
+-			i->text);
+-		abort();
+-	}
++		/* Find the correct gid entry */
++		for (e = i->ige; e < i->ige + i->iges; e++) {
+ 
+-	/* Copy our connection info from GID table */
+-	i->gid = e->gid;
+-	i->gid_index = e->gid_index;
+-	i->ifindex = e->ndev_ifindex;
+-
+-	/* Get more info about the IP network attached to the RDMA device */
+-	get_if_info(i);
+-
+-	/* Create RDMA interface setup */
+-	i->rdma_events = rdma_create_event_channel();
+-	if (!i->rdma_events) {
+-		logg(LOG_CRIT, "rdma_create_event_channel() for %s failed (%s).\n",
+-			i->text, errname());
+-		abort();
+-	}
++			if (e->port_num != i->port)
++				continue;
+ 
+-	sin = calloc(1, sizeof(struct sockaddr_in));
+-	sin->sin_family = AF_INET;
+-	sin->sin_addr = i->if_addr.sin_addr;
+-	sin->sin_port = htons(default_port);
++			if (in == INFINIBAND && e->gid_type == IBV_GID_TYPE_IB)
++				break;
++
++			if (in == ROCE && e->gid_type == IBV_GID_TYPE_ROCE_V2 &&
++					e->gid.global.subnet_prefix == 0)
++				break;
++		}
++
++		if (e >= i->ige + i->iges) {
++			logg(LOG_CRIT, "Failed to find GIDs in GID table for %s\n",
++				i->text);
++			abort();
++		}
++
++		/* Copy our connection info from GID table */
++		i->gid = e->gid;
++		i->gid_index = e->gid_index;
++		i->ifindex = e->ndev_ifindex;
++
++		/* Get more info about the IP network attached to the RDMA device */
++		get_if_info(i);
++
++		/* Create RDMA interface setup */
++		i->rdma_events = rdma_create_event_channel();
++		if (!i->rdma_events) {
++			logg(LOG_CRIT, "rdma_create_event_channel() for %s failed (%s).\n",
++				i->text, errname());
++			abort();
++		}
++	}
+ 
+ 	i->multicast = create_rdma_id(i, (struct sockaddr *)sin);
+-	i->ru_hash = hash_create(offsetof(struct rdma_unicast, sin), sizeof(struct sockaddr_in));
+ 
+ 	if (!i->multicast)
+ 		abort();
+@@ -1548,15 +1578,18 @@ static void setup_interface(enum interfa
+ 	}
+ 
+ 	if (unicast) {
++
+ 		i->ud = create_ud_channel(i, i->port, 100);
+ 		i->raw = create_raw_channel(i, i->port, 100);
+-		i->ip_to_ep = hash_create(offsetof(struct endpoint, addr), sizeof(struct in_addr));
+-		if (i == i2r + INFINIBAND)
+-			i->ep = hash_create(offsetof(struct endpoint, lid), sizeof(uint16_t));
++
++		if (i == i2r + ROCE)
++			i->ep = i->ip_to_ep;
+ 		else
+-			i->ep = i->ip_to_ep;;
++			i->ep = hash_create(offsetof(struct endpoint, lid), sizeof(uint16_t));
++
+ 	}
+ 
++out:
+ 	logg(LOG_NOTICE, "%s interface %s/%s(%d) port %d GID=%s/%d IPv4=%s:%d CQs=%u/%u/%u MTU=%u.\n",
+ 		i->text,
+ 		ibv_get_device_name(i->context->device),
+@@ -3869,15 +3902,20 @@ static void register_poll_events(void)
+ {
+ 	struct i2r_interface *i;
+ 
+-	for(i = i2r; i < i2r + NR_INTERFACES; i++)
+-	   if (i->context) {
++	for(i = i2r; i < i2r + NR_INTERFACES; i++) {
++		if (i->context) {
+ 
+-		register_callback(handle_rdma_event, i->rdma_events->fd, i);
+-		register_callback(handle_comp_event, i->multicast->comp_events->fd, i->multicast->comp_events);
+-		register_callback(handle_async_event, i->context->async_fd, i);
++			register_callback(handle_rdma_event, i->rdma_events->fd, i);
++			register_callback(handle_comp_event, i->multicast->comp_events->fd, i->multicast->comp_events);
++			register_callback(handle_async_event, i->context->async_fd, i);
++		}
+ 
+-		if (i->raw || i->ud)	/* They share the interface comp_events notifier */
+-			register_callback(handle_comp_event, i->comp_events->fd, i->comp_events);
++		if (i->raw || i->ud) {	/* They share the interface comp_events notifier */
++			if (i->context)
++				register_callback(handle_comp_event, i->comp_events->fd, i->comp_events);
++			else /* Socket */
++				register_callback(handle_multicast_event, i->fh, NULL);
++		}
+ 
+ 	}
+ 
+@@ -4323,7 +4361,8 @@ int main(int argc, char **argv)
+ 		return ret;
+ 
+ 	syslog (LOG_NOTICE, "Infiniband device = %s:%d, ROCE device = %s:%d. Multicast Groups=%d MGIDs=%s Buffers=%u\n",
+-			i2r[INFINIBAND].context ? ibv_get_device_name(i2r[INFINIBAND].context->device) : "<disabled>",
++			i2r[INFINIBAND].context ? ibv_get_device_name(i2r[INFINIBAND].context->device) :
++		       		(i2r[INFINIBAND].port ? i2r->if_name : "<disabled>"),
+ 			i2r[INFINIBAND].port,
+ 			i2r[ROCE].context ? ibv_get_device_name(i2r[ROCE].context->device) : "<disabled>",
+ 			i2r[ROCE].port,

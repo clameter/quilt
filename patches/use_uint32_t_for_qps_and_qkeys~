@@ -1,0 +1,14 @@
+Index: rdma-core/ib2roce/ib2roce.c
+===================================================================
+--- rdma-core.orig/ib2roce/ib2roce.c
++++ rdma-core/ib2roce/ib2roce.c
+@@ -213,7 +213,8 @@ struct rdma_channel {
+ struct forward {
+ 	struct endpoint *dest;
+ 	struct forward *next;
+-	unsigned short source_qp, dest_qp;
++	uint32_t source_qp, dest_qp;
++	uint32_t dest_qkey;
+ };
+ 
+ /*

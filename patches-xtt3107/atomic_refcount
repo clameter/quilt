@@ -1,0 +1,70 @@
+Index: rdma-core/ib2roce/ib2roce.c
+===================================================================
+--- rdma-core.orig/ib2roce/ib2roce.c
++++ rdma-core/ib2roce/ib2roce.c
+@@ -50,7 +50,7 @@
+ #include <ctype.h>
+ #include <pthread.h>
+ #include <numa.h>
+-
++#include <stdatomic.h>
+ #include <arpa/inet.h>
+ #include <sys/socket.h>
+ #include <netdb.h>
+@@ -953,26 +953,44 @@ static void __get_buf(struct buf *buf)
+ 	buf->refcount++;
+ }
+ 
+-static void get_buf(struct buf *buf)
+-{
+-	lock();
+-	__get_buf(buf);
+-	unlock();
+-}
+-
+-static void put_buf(struct buf *buf)
++static void __put_buf(struct buf *buf)
+ {
+-	lock();
+ 	buf->refcount--;
+ 	if (buf->refcount) {
+-		unlock();
+ 		return;
+ 	}
+ 
+-	__free_buffer(buf);
+-	unlock();
++	free_buffer(buf);
+ }
+ 
++static void get_buf(struct buf *buf)
++{
++	unsigned x;
++
++	if (multithreaded) {
++		x = atomic_fetch_add(&buf->refcount, 1);
++		if (!x)
++			/* Incrementing the refcount from 0 ??? */
++ 			abort();
++	} else
++		__get_buf(buf);
++}
++ 
++static void put_buf(struct buf *buf)
++{
++	unsigned x;
++
++	if (multithreaded) {
++		x = atomic_fetch_sub(&buf->refcount, 1);
++		if (x > 1)
++ 			return;
++
++		free_buffer(buf);
++	} else
++		__put_buf(buf);
++
++}
++ 
+ /* Remove all buffers related to a channel */
+ static void clear_channel_bufs(struct rdma_channel *c)
+ {

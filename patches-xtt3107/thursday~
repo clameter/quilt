@@ -1,0 +1,67 @@
+Index: rdma-core/ib2roce/ib2roce.c
+===================================================================
+--- rdma-core.orig/ib2roce/ib2roce.c
++++ rdma-core/ib2roce/ib2roce.c
+@@ -603,11 +603,13 @@ const char *mc_text[NR_MC_STATUS] = { "I
+  */
+ static struct mc {
+ 	struct in_addr addr;
++	struct ah_info ai[2];
++	unsigned long last_sent[2];	/* Timestamp of last packet sent */
++	unsigned pending[2];		/* Number of packets to be sent later */
+ 	enum mc_status status[2];
+ 	bool sendonly[2];
+ 	bool beacon;
+ 	uint16_t port;
+-	struct ah_info ai[2];
+ 	struct sockaddr *sa[2];
+ 	struct mgid_signature *mgid_mode;
+ 	const char *text;
+@@ -3422,8 +3424,8 @@ redo:
+ 		return NULL;
+ 	}
+ 
+-	if (rate)
+-		at->static_rate = rate;
++	if (hwrate)
++		at->static_rate = hwrate;
+ 
+ 	ah = ibv_create_ah(i->pd, at);
+ 	if (!ah) {
+@@ -3687,11 +3689,27 @@ static void receive_multicast(struct buf
+ 	if (drop_packets && (c->stats[packets_received] % drop_packets) == drop_packets - 1)
+ 		return;
+ 
++	if (swrate && m->last_sent[in]) {
++		unsigned long tdiff = timestamp() - m->last_sent[in];
++
++		if (tdiff < ((m->pending[in] + 1) * 10000000) / swrate) {
++			m->pending[in]++;
++			add_event(m->last_sent[in] + (m->pending[in] * 1000000) / swrate, send_delayed);
++			/* Schedule packet somewhere */
++			return;
++
++		}
++	} 
+ 	ret = send_to(i2r[in ^ 1].multicast, buf->cur, buf->end - buf->cur, m->ai + (in ^ 1), false, 0, buf);
+ 
+ 	if (ret)
+ 		return;
+ 
++	if (swrate) {
++		m->last_sent[in] = timestamp();
++		m->pending[in] = 0;
++	}
++
+ 	st(c, packets_bridged);
+ 	return;
+ 
+@@ -5380,7 +5398,7 @@ struct enable_option {
+ { "loopbackprev",	&loopback_blocking, NULL, "on", "off",	"Multicast loopback prevention of the NIC" },
+ { "packetsocket",	&packet_socket, NULL,	"on", "off",	"Use a packet socket instead of a RAW QP to capure IB/ROCE traffic" },
+ { "pgm",		NULL,	(int *)&pgm_mode, "on", "off",	"PGM processing mode (0=None, 1= Passtrough, 2=DLR, 3=Resend with new TSI" },
+-{ "hwrate",		NULL,	&rate,		"2", "0",	"Set the speed in the RDMA NIC to limit the output speed 2 =2.5GBPS 5 = 5GBPS 3 = 10GBPS ...(see enum ibv_rate)" },
++{ "hwrate",		NULL,	&hwrate,	"2", "0",	"Set the speed in the RDMA NIC to limit the output speed 2 =2.5GBPS 5 = 5GBPS 3 = 10GBPS ...(see enum ibv_rate)" },
+ { "swrate",		NULL, &swrate,		"1000", "0",	"Limit the packets per second to be sent to an endpoint (0=off)" },
+ { "raw",		&raw,	NULL,		"on", "off",	"Use of RAW sockets to capture SIDR Requests. Avoids having to use a patched kernel" },
+ { "unicast",		&unicast, NULL,		"on", "off",	"Processing of unicast packets with QP1 handling of SIDR REQ/REP" },

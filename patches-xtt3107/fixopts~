@@ -1,0 +1,464 @@
+Index: rdma-core/ib2roce/ib2roce.c
+===================================================================
+--- rdma-core.orig/ib2roce/ib2roce.c
++++ rdma-core/ib2roce/ib2roce.c
+@@ -911,12 +911,18 @@ static void free_buffer(struct buf *buf)
+ 	unlock();
+ }
+ 
+-static void get_buf(struct buf *buf)
++
++static void __get_buf(struct buf *buf)
+ {
+-	lock();
+ 	if (!buf->refcount)
+ 		abort();
+ 	buf->refcount++;
++}
++
++static void get_buf(struct buf *buf)
++{
++	lock();
++	__get_buf(buf);
+ 	unlock();
+ }
+ 
+@@ -2844,12 +2850,12 @@ struct hash *pgm_record;
+ static void init_pgm_streams(void)
+ {
+ 	pgm_hash = hash_create(0, sizeof(struct pgm_key));
+-	pgm_record = hash_create(0, sizeof(struct pgm_key) + sizeof(uint32_t));
++	pgm_record = hash_create(0, offsetof(struct pgm_record, stream));
+ }
+ 
+ static bool add_record(struct buf *buf, struct pgm_key *key, uint32_t sqn, void *start, unsigned len)
+ {
+-	struct pgm_record *r = calloc(1, sizeof(pgm_record));
++	struct pgm_record *r = calloc(1, sizeof(struct pgm_record));
+ 
+ 	r->key = *key;
+ 	r->sqn = sqn;
+@@ -2862,7 +2868,7 @@ static bool add_record(struct buf *buf,
+ 		unlock();
+ 		return false;
+ 	} else {
+-		get_buf(buf);
++		__get_buf(buf);
+ 		hash_add(pgm_record, &r);
+ 		unlock();
+ 		return true;
+@@ -2890,7 +2896,7 @@ static const char *format_stream_text(st
+ {
+ 	static char b[50];
+ 
+-	snprintf(b, sizeof(b), "%s(%s):%d", m->text, inet_ntoa(key->sender), key->source_port);
++	snprintf(b, sizeof(b), "%s:%d->%s", inet_ntoa(key->sender), ntohs(key->source_port), m->text);
+ 	return strdup(b);
+ }
+ 
+@@ -2899,8 +2905,9 @@ static void pgm_out(struct i2r_interface
+ 	struct pgm_key key;
+ 	struct pgm_stream *s;
+ 	uint32_t sqn;
+-	uint8_t *start;
++	uint32_t tdsu;
+ 	uint16_t total_opt_length = 0;
++	uint8_t *options_start;
+ 	union {
+ 		struct pgm_header pgm;
+ 		struct {
+@@ -2918,9 +2925,14 @@ static void pgm_out(struct i2r_interface
+ #endif
+ 	struct pgm_ack ack;
+ redo:
+-	start = buf->cur;
+ 	PULL(buf, header);
+ 
++	tdsu = ntohs(header.pgm.pgm_tsdu_length);
++
++//	logg(LOG_NOTICE, "PGM header sport=%d dport=%d type=%d options=%d checksum=%x TSDU LEN=%d Length=%lu\n",
++//		ntohs(header.pgm.pgm_sport), ntohs(header.pgm.pgm_dport), header.pgm.pgm_type, header.pgm.pgm_options, header.pgm.pgm_checksum,
++//		tdsu, buf->end - buf->raw);
++
+ 	memcpy(key.gsi, header.pgm.pgm_gsi, sizeof(key.gsi));
+ 	key.mcgroup = m->addr;
+ 	s = hash_find(pgm_hash, &key);
+@@ -2933,113 +2945,20 @@ redo:
+ 			s->key = key;
+ 			s->i = i;
+ 			s->text = format_stream_text(i, m, &key);
++			hash_add(pgm_hash, s);
+ 
+ 			logg(LOG_NOTICE, "%s: New Stream %s\n", i->text, s->text);
+ 		}
+ 		unlock();
+ 	}	
+ 
+-	if (header.pgm.pgm_options & 0x1) {
+-		bool last = false;
+-		uint8_t *opt_start = buf->cur;
+-
+-		do {
+-			struct pgm_opt_header opt;
+-			struct pgm_opt_length length;
+-			struct pgm_opt_fragment fragment;
+-			struct pgm_opt_nak_list nak_list;
+-			struct pgm_opt_join join;
+-			struct pgm_opt_redirect redirect;
+-			struct pgm_opt_fin fin;
+-			struct pgm_opt_syn syn;
+-			struct pgm_opt_rst rst;
+-			void *start_opt = buf->cur;
+-
+-			PULL(buf, opt);
+-			last = opt.opt_type & PGM_OPT_END;
+-			switch (opt.opt_type & PGM_OPT_MASK) {
+-				case PGM_OPT_LENGTH:
+-					PULL(buf, length);
+-					total_opt_length = length.opt_total_length;
+-					break;
+-				case PGM_OPT_FRAGMENT:
+-					PULL(buf, fragment);
+-					logg(LOG_NOTICE, "%s: OPT Fragment SQN=%x offset=%d len=%d\n", s->text,
+-						fragment.opt_sqn, fragment.opt_frag_off, fragment.opt_frag_len);
+-					break;
+-				case PGM_OPT_NAK_LIST:
+-					PULL(buf, nak_list);
+-					logg(LOG_NOTICE, "%s: OPT NAK list #%d\n", s->text, (opt.opt_length - 1) /4 );
+-
+-					break;
+-				case PGM_OPT_JOIN:
+-					PULL(buf, join);
+-					logg(LOG_NOTICE, "%s: OPT Join MIN SQN=%d\n",
+-							s->text, join.opt_join_min);
+-					break;
+-				case PGM_OPT_REDIRECT:
+-					PULL(buf, redirect);
+-
+-					logg(LOG_NOTICE, "%s: OPT Redirect NLA=%s\n", s->text, inet_ntoa(redirect.opt_nla));
+-					break;
+-
+-				/* Not sure if these options are in use.  They are mostly not necessary (?) */
+-				case PGM_OPT_SYN:
+-					PULL(buf, syn);
+-					logg(LOG_NOTICE, "%s: OPT SYN\n", s->text);
+-					break;
+-				case PGM_OPT_FIN:
+-					PULL(buf, fin);
+-					logg(LOG_NOTICE, "%s: OPT FIN\n", s->text);
+-					break;
+-				case PGM_OPT_RST:
+-					PULL(buf, rst);
+-					logg(LOG_NOTICE, "%s: OPT RST\n", s->text);
+-					break;
+-
+-				/* NAK Intervals */
+-				case PGM_OPT_NAK_BO_IVL:
+-				case PGM_OPT_NAK_BO_RNG:
+-
+-				/* NLA redirection */
+-				case PGM_OPT_PATH_NLA:
+-
+-				/* Broken Multicast ??? */
+-				case PGM_OPT_NBR_UNREACH:
+-
+-				case PGM_OPT_INVALID:
+-
+-				/* Congestion "Control" and avoidance. Traffic load feedback */
+-				case PGM_OPT_CR:
+-				case PGM_OPT_CRQST:
+-
+-				/* Forward Error correction.... How would this work ??? */
+-				case PGM_OPT_PARITY_PRM:
+-				case PGM_OPT_PARITY_GRP:
+-				case PGM_OPT_CURR_TGSIZE:
+-
+-				/* Extensions by PGMCC */
+-				case PGM_OPT_PGMCC_DATA:
+-				case PGM_OPT_PGMCC_FEEDBACK:
+-
+-				default: 
+-					logg(LOG_NOTICE, "%s: Invalid PGM option=%x. Option Skipped.\n", s->text, opt.opt_type);
+-					return;
+-			}
+-			buf->cur = start_opt + opt.opt_length;
+-		} while (!last);
+-
+-		if (total_opt_length != buf->cur - opt_start)
+-			logg(LOG_NOTICE, "%s: Option length mismatch. Expected %d but it is %ld\n", s->text, total_opt_length, buf->cur - opt_start);
+-	}
+-
+ 	switch (header.pgm.pgm_type) {
+ 		case PGM_SPM:		/* Multicast downstream */
+ 			PULL(buf, spm);
+-			logg(LOG_NOTICE, "%s: SPM SQN=%x TRAIL=%x LEAD=%x NLA=%s\n",
+-				s->text, spm.spm_sqn, spm.spm_trail, spm.spm_lead, inet_ntoa(spm.spm_nla));
+-			s->trail = spm.spm_trail;
+-			s->lead = spm.spm_lead;
++//			logg(LOG_NOTICE, "%s: SPM SQN=%x TRAIL=%x LEAD=%x NLA=%s\n",
++//				s->text, ntohl(spm.spm_sqn), ntohl(spm.spm_trail), ntohl(spm.spm_lead), inet_ntoa(spm.spm_nla));
++			s->trail = ntohl(spm.spm_trail);
++			s->lead = ntohl(spm.spm_lead);
+ 			if (s->last_seq < s->lead) {
+ 				/* We are missing packets */
+ 			}
+@@ -3053,39 +2972,64 @@ redo:
+ 		case PGM_ODATA:		/* Multicast downstream */
+ 		case PGM_RDATA:		/* Multicast downstream */
+ 			PULL(buf, data);
+-			logg(LOG_NOTICE, "%s: O/RDATA SQN=%x TRAIL=%x\n", s->text, data.data_sqn, data.data_trail);
++			logg(LOG_NOTICE, "%s: %cDATA SQN=%x TRAIL=%x last=%d last_seq=%d\n", s->text,
++				header.pgm.pgm_type == PGM_RDATA ? 'R' : 'O',
++				ntohl(data.data_sqn), ntohl(data.data_trail), s->last, s->last_seq);
+ 
+-			sqn = data.data_sqn;
++			sqn = ntohl(data.data_sqn);
+ 
+-			if (sqn < s->last_seq)
+-				/* Old repeated data */
++			if (!s->last_seq) {
++				/* First message on new stream */
++				s->last_seq = sqn - 1;
++				s->last = s->last_seq;
++				s->oldest = sqn;
++			}
++
++			if (sqn < s->last_seq) {
++				logg(LOG_NOTICE, "%s: Repeated data out of Window\n", s->text);
+ 				break;
++			}
+ 
+-			if (!add_record(buf, &key, sqn, start, sizeof(struct pgm_header) + total_opt_length + header.pgm.pgm_tsdu_length))
+-		       		/* Not so old but this is a record we already have */
++			if (sqn == s->last) {
++				logg(LOG_NOTICE, "%s: Sender is duplicating traffic %d\n", s->text, sqn);
+ 				break;
+-	
+-			/* Move tail/lead */
+-			if (data.data_trail > s->trail)
+-				s->trail = data.data_trail;
++			}
++
++			if (sqn < s->last && find_record(&key, sqn)) {
++				logg(LOG_NOTICE, "%s: Repeated data in Window SQN=%d\n", s->text, sqn);
++				break;
++			}
++
++			/* Move trail/lead */
++			if (ntohl(data.data_trail) > s->trail)
++				s->trail = ntohl(data.data_trail);
+ 
+ 			if (sqn > s->lead)
+-				s->lead = data.data_sqn;
++				s->lead = sqn;
++
++			/* This is either the next data or missing data */
+ 
+-			if (sqn == s->last_seq + 1 || !s->last_seq) {
++			if (!add_record(buf, &key, sqn, buf->cur, tdsu))
++				abort();
++
++			if (sqn == s->last_seq + 1) {
+ 				/* The next packet that we need ! */
+ 				s->last_seq = sqn;
+ 				forward_packet(buf, &key, sqn);
+ 				deliver_in_seq(buf, &key, sqn);
+ 
+-				if (s->last + 1 == sqn || !s->last) {
+-					/* Perfect this is the way it should be. Consistent history */
++				if (sqn == s->last + 1) {
++					logg(LOG_NOTICE, "Perfect stream\n");
++					/* Stream without pending holes in the sequence */
+ 					s->last = sqn;
+ 				} else {
+ 					/* We just filled up in a missing piece check how long our consistent history goes now */
+-					while (s->last_seq <= s->last) {
++					while (s->last_seq < s->last) {
+ 						struct pgm_record *r = find_record(&key, s->last_seq + 1);
++
+ 						if (r) {
++							logg(LOG_NOTICE, "Found earlier record %d\n", s->last_seq + 1);
++
+ 							deliver_in_seq(r->buf, &key, s->last_seq + 1);
+ 							s->last_seq++;
+ 						} else
+@@ -3093,7 +3037,8 @@ redo:
+ 					}
+ 					/* If this was RDATA and there still is a hole then send NAK */
+ 				}
+-			} else { /* We have received some future record */
++			} else {
++				logg(LOG_NOTICE, "Out of sequence sqn=%d last_seq=%d s->last=%d\n", sqn, s->last_seq, s->last);
+ 				forward_packet(buf, &key, sqn);
+ 				s->last = sqn;
+ 				/* We have opened up some hole between s->last_seq and s->last. Could send NAK */
+@@ -3101,9 +3046,9 @@ redo:
+ 				/* s->last_seq ... s->last -1 is missing at this point */
+ 
+ 				if (s->last_seq < s->trail) {
+-					/* Unrecoverable packet loss */
++					logg(LOG_ERR, "Unrecoverable Dataloss !\n");
+ 				} else {
+-					/* Send NAK */
++					logg(LOG_NOTICE, "Nak Processing not implemented yet\n");
+ 				}
+ 			}
+ 
+@@ -3130,11 +3075,10 @@ redo:
+ 			logg(LOG_NOTICE, "%s: POLR\n", s->text);
+ 			break;
+ #endif
+-
+ 		/* Not RFC compliant but it seems to be used sometimes */
+ 		case PGM_ACK:		/* Unicast upstream */
+ 			PULL(buf, ack);
+-			logg(LOG_NOTICE, "%s: ACK RX_MAX=%x BITMAP=%x\n", s->text, ack.ack_rx_max, ack.ack_bitmap);
++			logg(LOG_NOTICE, "%s: ACK RX_MAX=%x BITMAP=%x\n", s->text, ntohl(ack.ack_rx_max), ack.ack_bitmap);
+ 			break;
+ 
+ 		default:
+@@ -3142,7 +3086,122 @@ redo:
+ 			return;
+ 	}
+ 
+-	buf->cur = start + sizeof(struct pgm_header) + total_opt_length + header.pgm.pgm_tsdu_length;
++	options_start = buf->cur;
++	if (header.pgm.pgm_options & 0x1) {
++		bool last = false;
++
++		do {
++			struct pgm_opt_header opt;
++			struct pgm_opt_length length;
++			struct pgm_opt_fragment fragment;
++			struct pgm_opt_nak_list nak_list;
++			struct pgm_opt_join join;
++			struct pgm_opt_redirect redirect;
++			struct pgm_opt_fin fin;
++			struct pgm_opt_syn syn;
++			struct pgm_opt_rst rst;
++			uint8_t *start_option = buf->cur;
++
++			PULL(buf, opt);
++//			logg(LOG_NOTICE, "OPTION type=%d len=%d reserved=%x\n",
++//					opt.opt_type, opt.opt_length, opt.opt_reserved);
++
++			if (opt.opt_length == 0) {
++				logg(LOG_NOTICE, "Invalid option length zero\n");
++				return;
++			}
++
++			last = opt.opt_type & PGM_OPT_END;
++			switch (opt.opt_type & PGM_OPT_MASK) {
++				case PGM_OPT_LENGTH:
++					buf->cur = start_option;
++					PULL(buf, length);
++					total_opt_length = ntohs(length.opt_total_length);
++//					logg(LOG_NOTICE, "%s: OPT total_length %d\n", s->text,
++//						total_opt_length);
++					break;
++				case PGM_OPT_FRAGMENT:
++					PULL(buf, fragment);
++					logg(LOG_NOTICE, "%s: OPT Fragment SQN=%x offset=%d len=%d\n", s->text,
++						ntohl(fragment.opt_sqn), ntohl(fragment.opt_frag_off), ntohl(fragment.opt_frag_len));
++					break;
++				case PGM_OPT_NAK_LIST:
++					PULL(buf, nak_list);
++					logg(LOG_NOTICE, "%s: OPT NAK list #%d\n", s->text, (opt.opt_length - 1) /4 );
++
++					break;
++				case PGM_OPT_JOIN:
++					PULL(buf, join);
++					logg(LOG_NOTICE, "%s: OPT Join MIN SQN=%d\n",
++							s->text, ntohl(join.opt_join_min));
++					break;
++				case PGM_OPT_REDIRECT:
++					PULL(buf, redirect);
++
++					logg(LOG_NOTICE, "%s: OPT Redirect NLA=%s\n", s->text, inet_ntoa(redirect.opt_nla));
++					break;
++
++				/* Not sure if these options are in use.  They are mostly not necessary (?) */
++				case PGM_OPT_SYN:
++					PULL(buf, syn);
++					logg(LOG_NOTICE, "%s: OPT SYN\n", s->text);
++					break;
++				case PGM_OPT_FIN:
++					PULL(buf, fin);
++					logg(LOG_NOTICE, "%s: OPT FIN\n", s->text);
++					break;
++				case PGM_OPT_RST:
++					PULL(buf, rst);
++					logg(LOG_NOTICE, "%s: OPT RST\n", s->text);
++					break;
++
++				case 0x21:
++				case 0x22:
++				case 0x23:
++				case 0x24:
++					break;
++
++				/* NAK Intervals */
++				case PGM_OPT_NAK_BO_IVL:
++				case PGM_OPT_NAK_BO_RNG:
++
++				/* NLA redirection */
++				case PGM_OPT_PATH_NLA:
++
++				/* Broken Multicast ??? */
++				case PGM_OPT_NBR_UNREACH:
++
++				case PGM_OPT_INVALID:
++
++				/* Congestion "Control" and avoidance. Traffic load feedback */
++				case PGM_OPT_CR:
++				case PGM_OPT_CRQST:
++
++				/* Forward Error correction.... How would this work ??? */
++				case PGM_OPT_PARITY_PRM:
++				case PGM_OPT_PARITY_GRP:
++				case PGM_OPT_CURR_TGSIZE:
++
++				/* Extensions by PGMCC */
++				case PGM_OPT_PGMCC_DATA:
++				case PGM_OPT_PGMCC_FEEDBACK:
++
++				default: 
++					logg(LOG_NOTICE, "%s: Invalid PGM option=%x Option Skipped. D=%s\n",
++						s->text, opt.opt_type & PGM_OPT_MASK,
++						_hexbytes(start_option, opt.opt_length)); 
++					break;
++			}
++			buf->cur = start_option + opt.opt_length;
++		} while (!last);
++
++		if (total_opt_length != buf->cur - options_start)
++			logg(LOG_NOTICE, "%s: Option length mismatch. Expected %d but it is %ld\n", s->text, total_opt_length, buf->cur - options_start);
++	}
++
++//	logg(LOG_NOTICE, "Finished options end = %lu cur=%lu\n", options_start + total_opt_length - buf->raw, buf->cur - buf->raw);
++	buf->cur = options_start + total_opt_length;
++	buf->cur += tdsu;	/* Skip potential data */
+ 	if (buf->cur < buf->end)
+ 		goto redo;
+ 
+@@ -3541,15 +3600,16 @@ static void receive_multicast(struct buf
+ 		}
+ 	}
+ 
+-	if (parse_pgm) {
+-		pgm_out(c->i, m, buf);
+-	}
+-
+ 	if (m->beacon) {
+ 		beacon_received(buf);
+ 		return;
+ 	}
+ 
++	if (parse_pgm) {
++		pgm_out(c->i, m, buf);
++		return;
++	}
++
+ 	if (!bridging)
+ 		return;
+ 

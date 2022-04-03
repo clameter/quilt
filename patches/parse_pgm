@@ -10,7 +10,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  
  /* Timestamp in milliseconds */
  static unsigned long timestamp(void)
-@@ -2805,6 +2806,359 @@ static unsigned int remove_forwards(stru
+@@ -2810,6 +2811,359 @@ static unsigned int remove_forwards(stru
  	return n;
  }
  
@@ -370,7 +370,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  #if 0
  /*
   * Update the forwarder if the source point changes
-@@ -3198,6 +3552,10 @@ static void receive_multicast(struct buf
+@@ -3203,6 +3557,10 @@ static void receive_multicast(struct buf
  		}
  	}
  
@@ -381,7 +381,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  	if (m->beacon) {
  		beacon_received(buf);
  		return;
-@@ -4857,6 +5215,7 @@ struct enable_option {
+@@ -4862,6 +5220,7 @@ struct enable_option {
  {	"huge", &huge, NULL, "on", "off", "Enable the use of Huge memory for the packet pool" }, 
  {	"loopbackprev", &loopback_blocking, NULL, "on", "off", "Multicast loopback prevention of the NIC" },
  {	"packetsocket", &packet_socket, NULL, "on", "off", "Use a packet socket instead of a RAW QP to capure IB/ROCE traffic" },
@@ -389,7 +389,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  {	"rate", NULL, &rate, "2", "0", "Make RDMA limit the output speed 2 =2.5GBPS 5 = 5GBPS 3 = 10GBPS ...(see enum ibv_rate)" },
  { 	"raw", 	&raw, NULL, "on", "off", "Use of RAW sockets to capture SIDR Requests. Avoids having to use a patched kernel" },
  {	"unicast", &unicast, NULL, "on", "off", "Processing of unicast packets with QP1 handling of SIDR REQ/REP" },
-@@ -5166,6 +5525,7 @@ int main(int argc, char **argv)
+@@ -5171,6 +5530,7 @@ int main(int argc, char **argv)
  			nr_mc, mgid_mode->id, nr_buffers);
  
  	init_buf();	/* Setup interface registers memmory */

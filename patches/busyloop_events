@@ -1,0 +1,21 @@
+Index: rdma-core/ib2roce/ib2roce.c
+===================================================================
+--- rdma-core.orig/ib2roce/ib2roce.c
++++ rdma-core/ib2roce/ib2roce.c
+@@ -1344,6 +1344,7 @@ static void *busyloop(void *private)
+ 
+ 	core->state = core_running;
+ 
++	now = timestamp(); 	/* Will be done by run_events in the future */
+ 	do {
+ 		cpu_relax();
+ 		/* Scan CQs */
+@@ -1362,6 +1363,7 @@ static void *busyloop(void *private)
+ 				}
+ 			}
+ 		}
++		run_events();
+ 
+ 	} while (!terminated);
+ 
+	

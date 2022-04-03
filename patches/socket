@@ -2,7 +2,7 @@ Index: rdma-core/ib2roce/ib2roce.c
 ===================================================================
 --- rdma-core.orig/ib2roce/ib2roce.c
 +++ rdma-core/ib2roce/ib2roce.c
-@@ -61,6 +61,7 @@
+@@ -62,6 +62,7 @@
  #include <infiniband/verbs.h>
  #include <poll.h>
  #include <sys/mman.h>
@@ -10,7 +10,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  
  #include <linux/rtnetlink.h>
  #include <net/ethernet.h>
-@@ -195,6 +196,10 @@ out:
+@@ -210,6 +211,10 @@ out:
  
  const struct in_addr ip_none = { .s_addr = 0 };
  
@@ -21,7 +21,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  /*
   * Handling of special Multicast Group MGID encodings on Infiniband
   */
-@@ -247,8 +252,8 @@ static int cq_high = 0;	/* Largest batch
+@@ -263,8 +268,8 @@ static int cq_high = 0;	/* Largest batch
  
  enum channel_type { channel_rdmacm, channel_ud, channel_qp1,
  	channel_raw, channel_ibraw,
@@ -32,15 +32,15 @@ Index: rdma-core/ib2roce/ib2roce.c
  
  struct buf;
  
-@@ -384,6 +389,7 @@ static inline void st(struct rdma_channe
- static void add_event(unsigned long time_in_ms, void (*callback));
+@@ -425,6 +430,7 @@ static void add_event(uint64_t  when, ev
+ static uint64_t run_events(void);
  static struct rdma_unicast *new_rdma_unicast(struct i2r_interface *i, struct sockaddr_in *sin);
  static void register_callback(void (*callback)(void *), int fd, void *private);
 +static void handle_receive_raw_packet(void *private);
  static void handle_receive_packet(void *private);
  static void handle_comp_event(void *private);
  static void handle_rdma_event(void *private);
-@@ -455,6 +461,54 @@ success:
+@@ -496,6 +502,54 @@ success:
  	return 1;
  }
  
@@ -95,7 +95,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  /* Scan through available RDMA devices in order to locate the devices for bridging */
  static int find_rdma_devices(void)
  {
-@@ -523,7 +577,8 @@ static int find_rdma_devices(void)
+@@ -564,7 +618,8 @@ static int find_rdma_devices(void)
  	ibv_free_device_list(list);
  
  
@@ -105,7 +105,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  
  		if (roce_name && roce_name[0] == '-')
  			/* Disabled on the command line */
-@@ -538,7 +593,7 @@ static int find_rdma_devices(void)
+@@ -579,7 +634,7 @@ static int find_rdma_devices(void)
  		}
  	}
  
@@ -114,7 +114,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  
  		if ((ib_name && ib_name[0] == '-') && bridging)
  			/* Disabled on the command line */
-@@ -1034,7 +1089,7 @@ static void init_buf(void)
+@@ -1108,7 +1163,7 @@ static void init_buf(void)
  
  typedef bool setup_callback(struct rdma_channel *c);
  static receive_callback receive_main, receive_multicast, receive_raw, receive_ud, receive_qp1;
@@ -123,7 +123,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  
  #define NO_CORE (-1)
  /*
-@@ -1055,12 +1110,13 @@ struct channel_info {
+@@ -1129,12 +1184,13 @@ struct channel_info {
  	enum channel_type fallback;
  
  } channel_infos[nr_channel_types] = {
@@ -138,7 +138,42 @@ Index: rdma-core/ib2roce/ib2roce.c
  	{ "incoming",	-1, -1,	false,	100,	50,	0,		0,			setup_incoming,	receive_main,	channel_err },
  	{ "error",	-1, -1,	false,	0,	0,	0,		0,			NULL,		NULL,		channel_err },
  };
-@@ -1924,6 +1980,36 @@ static bool setup_packet(struct rdma_cha
+@@ -1879,6 +1935,34 @@ bool setup_multicast(struct rdma_channel
+ 	struct sockaddr_in *sin;
+ 	int ret;
+ 
++	i->rdma_events = rdma_create_event_channel();
++	if (!i->rdma_events) {
++		logg(LOG_CRIT, "rdma_create_event_channel() for %s failed (%s).\n",
++			i->text, errname());
++		abort();
++	}
++	register_callback(handle_rdma_event, i->rdma_events->fd, i);
++
++	i->pd = ibv_alloc_pd(i->context);
++	if (!i->pd) {
++		logg(LOG_CRIT, "ibv_alloc_pd failed for %s.\n", i->text);
++		abort();
++	}
++
++	i->comp_events = ibv_create_comp_channel(i->context);
++	if (!i->comp_events) {
++		logg(LOG_CRIT, "ibv_create_comp_channel failed for %s : %s.\n",
++			i->text, errname());
++		abort();
++	}
++	register_callback(handle_comp_event, i->comp_events->fd, i->comp_events);
++
++	i->mr = ibv_reg_mr(i->pd, buffers, nr_buffers * sizeof(struct buf), IBV_ACCESS_LOCAL_WRITE);
++	if (!i->mr) {
++		logg(LOG_CRIT, "ibv_reg_mr failed for %s:%s.\n", i->text, errname());
++		abort();
++	}
++
+ 	sin = calloc(1, sizeof(struct sockaddr_in));
+ 	sin->sin_family = AF_INET;
+ 	sin->sin_addr = i->if_addr.sin_addr;
+@@ -2004,6 +2088,36 @@ static bool setup_packet(struct rdma_cha
  	}
  
  	c->fh = fh;
@@ -175,97 +210,87 @@ Index: rdma-core/ib2roce/ib2roce.c
  	register_callback(handle_receive_packet, fh, c);
  	return true;
  }
-@@ -1957,6 +2043,7 @@ static void setup_interface(enum interfa
- 	struct i2r_interface *i = i2r + in;
+@@ -2032,21 +2146,10 @@ static bool setup_raw(struct rdma_channe
+ 	return true;
+ }
+ 
+-static void setup_interface(enum interfaces in)
++static bool find_gid_table_entry(struct i2r_interface *i)
+ {
+-	struct i2r_interface *i = i2r + in;
  	struct ibv_gid_entry *e;
- 	char buf[INET6_ADDRSTRLEN];
-+	enum channel_type type;
+-	char buf[INET6_ADDRSTRLEN];
+-
+-	if (in == INFINIBAND)
+-		i->maclen = 20;
+-	else
+-		i->maclen = 6;
+-
+-	if (!i->context)
+-		return;
+-
+-	i->text = interfaces_text[in];
++	enum interfaces in = i - i2r;
  
- 	if (in == INFINIBAND)
- 		i->maclen = 20;
-@@ -1966,42 +2053,50 @@ static void setup_interface(enum interfa
- 	if (!i->context)
- 		return;
- 
-+	if (i->context == &sock_context)
-+		type = channel_socket;
-+	else
-+		type = channel_rdmacm;
-+
- 	i->text = interfaces_text[in];
- 
--	/* Determine the GID */
--	i->iges = ibv_query_gid_table(i->context, i->ige, MAX_GID, 0);
-+	if (type == channel_rdmacm) {
-+		/* Determine the GID */
-+		i->iges = ibv_query_gid_table(i->context, i->ige, MAX_GID, 0);
-+
-+		if (i->iges <= 0) {
-+			logg(LOG_CRIT, "Error %s. Failed to obtain GID table for %s\n",
-+				errname(), i->text);
-+			abort();
-+		}
- 
--	if (i->iges <= 0) {
--		logg(LOG_CRIT, "Error %s. Failed to obtain GID table for %s\n",
--			errname(), i->text);
--		abort();
--	}
-+		/* Find the correct gid entry */
-+		for (e = i->ige; e < i->ige + i->iges; e++) {
-+	
-+			if (e->port_num != i->port)
-+				continue;
- 
--	/* Find the correct gid entry */
--	for (e = i->ige; e < i->ige + i->iges; e++) {
-+			if (in == INFINIBAND && e->gid_type == IBV_GID_TYPE_IB)
-+				break;
- 
--		if (e->port_num != i->port)
--			continue;
-+			if (in == ROCE && e->gid_type == IBV_GID_TYPE_ROCE_V2 &&
-+					e->gid.global.subnet_prefix == 0)
-+				break;
-+		}
- 
--		if (in == INFINIBAND && e->gid_type == IBV_GID_TYPE_IB)
--			break;
-+		if (e >= i->ige + i->iges) {
-+			logg(LOG_CRIT, "Failed to find GIDs in GID table for %s\n",
-+				i->text);
-+			abort();
-+		}
- 
--		if (in == ROCE && e->gid_type == IBV_GID_TYPE_ROCE_V2 &&
--				e->gid.global.subnet_prefix == 0)
--			break;
--	}
-+		/* Copy our connection info from GID table */
-+		i->gid = e->gid;
-+		i->gid_index = e->gid_index;
-+		i->ifindex = e->ndev_ifindex;
- 
--	if (e >= i->ige + i->iges) {
--		logg(LOG_CRIT, "Failed to find GIDs in GID table for %s\n",
--			i->text);
--		abort();
+ 	/* Determine the GID */
+ 	i->iges = ibv_query_gid_table(i->context, i->ige, MAX_GID, 0);
+@@ -2055,7 +2158,7 @@ static void setup_interface(enum interfa
+ 		logg(LOG_CRIT, "Error %s. Failed to obtain GID table for %s\n",
+ 			errname(), i->text);
+ 		i->context = NULL;
+-		return;
++		return false;
  	}
  
--	/* Copy our connection info from GID table */
--	i->gid = e->gid;
--	i->gid_index = e->gid_index;
--	i->ifindex = e->ndev_ifindex;
--
+ 	/* Find the correct gid entry */
+@@ -2076,7 +2179,7 @@ static void setup_interface(enum interfa
+ 		logg(LOG_CRIT, "Failed to find a suitable entry GID table for %s\n",
+ 			i->text);
+ 		i->context = NULL;
+-		return;
++		false;
+ 	}
+ 
+ 	/* Copy our connection info from GID table */
+@@ -2084,6 +2187,33 @@ static void setup_interface(enum interfa
+ 	i->gid_index = e->gid_index;
+ 	i->ifindex = e->ndev_ifindex;
+ 
++	return true;
++}
++
++
++static void setup_interface(enum interfaces in)
++{
++	struct i2r_interface *i = i2r + in;
++	enum channel_type type;
++
++	if (in == INFINIBAND)
++		i->maclen = 20;
++	else
++		i->maclen = 6;
++
++	if (!i->context)
++		return;
++
++	i->text = interfaces_text[in];
++
++	if (i->context == &sock_context)
++		type = channel_socket;
++	else {
++		type = channel_rdmacm;
++		if (!find_gid_table_entry(i))
++			return;
++	}
++
  	/* Get more info about the IP network attached to the RDMA device */
  	get_if_info(i);
  
-@@ -2014,35 +2109,35 @@ static void setup_interface(enum interfa
+@@ -2096,38 +2226,7 @@ static void setup_interface(enum interfa
  	else
  		i->ep = i->ip_to_ep;;
  
-+	if (type == channel_rdmacm) {
- 
+-
 -	/* Create RDMA elements that are interface wide */
 -
 -	i->rdma_events = rdma_create_event_channel();
@@ -275,25 +300,13 @@ Index: rdma-core/ib2roce/ib2roce.c
 -		abort();
 -	}
 -	register_callback(handle_rdma_event, i->rdma_events->fd, i);
-+		i->rdma_events = rdma_create_event_channel();
-+		if (!i->rdma_events) {
-+			logg(LOG_CRIT, "rdma_create_event_channel() for %s failed (%s).\n",
-+				i->text, errname());
-+			abort();
-+		}
-+		register_callback(handle_rdma_event, i->rdma_events->fd, i);
- 
+-
 -	i->pd = ibv_alloc_pd(i->context);
 -	if (!i->pd) {
 -		logg(LOG_CRIT, "ibv_alloc_pd failed for %s.\n", i->text);
 -		abort();
 -	}
-+		i->pd = ibv_alloc_pd(i->context);
-+		if (!i->pd) {
-+			logg(LOG_CRIT, "ibv_alloc_pd failed for %s.\n", i->text);
-+			abort();
-+		}
- 
+-
 -	i->comp_events = ibv_create_comp_channel(i->context);
 -	if (!i->comp_events) {
 -		logg(LOG_CRIT, "ibv_create_comp_channel failed for %s : %s.\n",
@@ -301,27 +314,34 @@ Index: rdma-core/ib2roce/ib2roce.c
 -		abort();
 -	}
 -	register_callback(handle_comp_event, i->comp_events->fd, i->comp_events);
-+		i->comp_events = ibv_create_comp_channel(i->context);
-+		if (!i->comp_events) {
-+			logg(LOG_CRIT, "ibv_create_comp_channel failed for %s : %s.\n",
-+				i->text, errname());
-+			abort();
-+		}
-+		register_callback(handle_comp_event, i->comp_events->fd, i->comp_events);
- 
+-
 -	i->mr = ibv_reg_mr(i->pd, buffers, nr_buffers * sizeof(struct buf), IBV_ACCESS_LOCAL_WRITE);
 -	if (!i->mr) {
 -		logg(LOG_CRIT, "ibv_reg_mr failed for %s:%s.\n", i->text, errname());
 -		abort();
-+		i->mr = ibv_reg_mr(i->pd, buffers, nr_buffers * sizeof(struct buf), IBV_ACCESS_LOCAL_WRITE);
-+		if (!i->mr) {
-+			logg(LOG_CRIT, "ibv_reg_mr failed for %s:%s.\n", i->text, errname());
-+			abort();
-+		}
- 	}
+-	}
+-
+-	i->multicast = new_rdma_channel(i, channel_rdmacm);
++	i->multicast = new_rdma_channel(i, type);
  
- 	i->multicast = new_rdma_channel(i, channel_rdmacm);
-@@ -2552,6 +2647,21 @@ static int send_to(struct rdma_channel *
+ 	if (!i->multicast)
+ 		abort();
+@@ -2152,12 +2251,12 @@ static void setup_interface(enum interfa
+ 
+ 	numa_run_on_node(-1);
+ 
+-	logg(LOG_NOTICE, "%s interface %s/%s(%d) port %d GID=%s/%d IPv4=%s:%d CQs=%u/%u/%u MTU=%u NUMA=%d.\n",
++	logg(LOG_NOTICE, "%s interface %s/%s(%d) port %d GIDindex=%d IPv4=%s:%d CQs=%u/%u/%u MTU=%u NUMA=%d.\n",
+ 		i->text,
+ 		i->rdma_name,
+ 		i->if_name, i->ifindex,
+ 		i->port,
+-		inet_ntop(AF_INET6, e->gid.raw, buf, INET6_ADDRSTRLEN),i->gid_index,
++		i->gid_index,
+ 		inet_ntoa(i->if_addr.sin_addr), default_port,
+ 		i->multicast ? i->multicast->nr_cq: 0,
+ 		i->ud ? i->ud->nr_cq : 0,
+@@ -2647,6 +2746,21 @@ static int send_to(struct rdma_channel *
  	struct ibv_sge sge;
  	int ret;
  
@@ -343,7 +363,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  	if (!d->ep->ah)
  		abort();	/* Send without a route */
  
-@@ -4512,11 +4622,75 @@ static void handle_comp_event(void *priv
+@@ -4789,11 +4903,75 @@ static void handle_comp_event(void *priv
  		process_cqes(c, wc, cqs);
  }
  

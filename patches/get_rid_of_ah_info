@@ -2,7 +2,7 @@ Index: rdma-core/ib2roce/ib2roce.c
 ===================================================================
 --- rdma-core.orig/ib2roce/ib2roce.c
 +++ rdma-core/ib2roce/ib2roce.c
-@@ -308,6 +308,24 @@ struct endpoint {
+@@ -334,6 +334,24 @@ struct endpoint {
  	struct forward *forwards;
  };
  
@@ -25,9 +25,9 @@ Index: rdma-core/ib2roce/ib2roce.c
 +}
 +
  static struct i2r_interface {
+ 	/* Not changed when multithreading */
  	struct ibv_context *context;		/* Not for RDMA CM use */
- 	struct rdma_event_channel *rdma_events;
-@@ -343,17 +361,6 @@ static struct i2r_interface {
+@@ -383,17 +401,6 @@ static struct i2r_interface {
  } i2r[NR_INTERFACES];
  
  /*
@@ -45,7 +45,7 @@ Index: rdma-core/ib2roce/ib2roce.c
   * A Unicastconnection to a certain port and host with
   * a list of pending I/O items and an rdma channel
   */
-@@ -366,7 +373,7 @@ struct rdma_unicast {
+@@ -406,7 +413,7 @@ struct rdma_unicast {
  	struct sockaddr_in sin;		/* Target address */
  	struct rdma_channel *c;		/* Channel for resolution and I/O */
  	struct fifo pending;		/* Buffers waiting on resolution to complete */
@@ -54,7 +54,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  };
  
  static inline void st(struct rdma_channel *c, enum stats s)
-@@ -382,6 +389,7 @@ static void handle_receive_packet(void *
+@@ -423,6 +430,7 @@ static void handle_receive_packet(void *
  static void handle_comp_event(void *private);
  static void handle_rdma_event(void *private);
  static void handle_async_event(void *private);
@@ -62,21 +62,21 @@ Index: rdma-core/ib2roce/ib2roce.c
  
  
  static inline struct rdma_cm_id *id(enum interfaces i)
-@@ -575,7 +583,7 @@ static struct mc {
- 	enum mc_status status[2];
- 	bool sendonly[2];
- 	bool beacon;
--	struct ah_info ai[2];
-+	struct dest dest[2];
- 	struct sockaddr *sa[2];
- 	struct mgid_signature *mgid_mode;
- 	const char *text;
-@@ -2247,13 +2255,11 @@ static void handle_rdma_event(void *priv
+@@ -619,7 +627,7 @@ const char *mc_text[NR_MC_STATUS] = { "I
+ struct mc_interface {
+ 	enum mc_status status;
+ 	bool sendonly;
+-	struct ah_info ai;
++	struct dest dest;
+ 	struct sockaddr *sa;
+ 	uint32_t packet_time;		/* How much time must elapse for a packet to be sent 0 = disabled */
+ 	uint32_t max_burst;		/* How long can a burst last */
+@@ -2332,13 +2340,11 @@ static void handle_rdma_event(void *priv
  			{
  				struct rdma_ud_param *param = &event->param.ud;
  				struct mc *m = (struct mc *)param->private_data;
--				struct ah_info *a = m->ai + in;
-+				struct dest *d = m->dest + in;
+-				struct ah_info *a = &m->interface[in].ai;
++				struct dest *d = &m->interface[in].dest;
  				char buf[40];
  
 -				a->remote_qpn = param->qp_num;
@@ -87,8 +87,8 @@ Index: rdma-core/ib2roce/ib2roce.c
 +				if (!d->ep->ah) {
  					logg(LOG_ERR, "Failed to create AH for Multicast group %s on %s \n",
  						m->text, i->text);
- 					m->status[in] = MC_ERROR;
-@@ -2396,14 +2402,12 @@ static void handle_rdma_event(void *priv
+ 					m->interface[in].status = MC_ERROR;
+@@ -2490,14 +2496,12 @@ static void handle_rdma_event(void *priv
  
  		case RDMA_CM_EVENT_ESTABLISHED:
  			{
@@ -105,7 +105,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  
  				rdma_ack_cm_event(event);
  				ru->state = UC_CONNECTED;
-@@ -2446,7 +2450,7 @@ err:
+@@ -2540,7 +2544,7 @@ err:
   *
   * Space in the WR is limited, so it only works for very small packets.
   */
@@ -114,7 +114,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  {
  	struct ibv_sge sge = {
  		.length = len,
-@@ -2461,9 +2465,9 @@ static int send_inline(struct rdma_chann
+@@ -2555,9 +2559,9 @@ static int send_inline(struct rdma_chann
  		.wr = {
  			/* Get addr info  */
  			.ud = {
@@ -127,7 +127,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  			}
  		}
  
-@@ -2541,7 +2545,7 @@ static int send_ud(struct rdma_channel *
+@@ -2636,7 +2640,7 @@ static int send_ud(struct rdma_channel *
   * to be able to free up resources when done.
   */
  static int send_to(struct rdma_channel *c,
@@ -136,7 +136,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  	bool imm_used, unsigned imm,
  	struct buf *buf)
  {
-@@ -2549,7 +2553,7 @@ static int send_to(struct rdma_channel *
+@@ -2644,7 +2648,7 @@ static int send_to(struct rdma_channel *
  	struct ibv_sge sge;
  	int ret;
  
@@ -145,7 +145,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  		abort();	/* Send without a route */
  
  	buf->c = c;	/* Change ownership to sending channel */
-@@ -2564,9 +2568,9 @@ static int send_to(struct rdma_channel *
+@@ -2659,9 +2663,9 @@ static int send_to(struct rdma_channel *
  	wr.imm_data = imm;
  
  	/* Get addr info  */
@@ -158,7 +158,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  
  	sge.length = len;
  	sge.lkey = c->mr->lkey;
-@@ -2593,9 +2597,9 @@ static int send_buf(struct buf *buf, str
+@@ -2690,9 +2694,9 @@ static int send_buf(struct buf *buf, str
  	int ret;
  
  	if (len < MAX_INLINE_DATA) {
@@ -170,7 +170,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  
  	return ret;
  }
-@@ -3346,7 +3350,28 @@ redo:
+@@ -3539,7 +3543,28 @@ redo:
  	return ep;
  }
  
@@ -181,14 +181,14 @@ Index: rdma-core/ib2roce/ib2roce.c
 +
 +	if (rate)
 +		at->static_rate = rate;
-+
+ 
 +	ah = ibv_create_ah(pd, at);
 +	if (!ah) {
 +		logg(LOG_ERR, "mc_to_ep: Failed to create Endpoint on %s: %s. IP=%s\n",
 +				i->text, errname(), inet_ntoa(addr));
 +		return NULL;
 +	}
- 
++
 +	ep = calloc(1, sizeof(struct endpoint));
 +	ep->i = i;
 +	ep->addr = addr;
@@ -199,24 +199,33 @@ Index: rdma-core/ib2roce/ib2roce.c
  
  /* Create Endpoint just from the IP address */
  static struct endpoint *ip_to_ep(struct i2r_interface *i, struct in_addr addr)
-@@ -3567,7 +3592,7 @@ static void receive_multicast(struct buf
- 	if (drop_packets && (c->stats[packets_received] % drop_packets) == drop_packets - 1)
- 		return;
+@@ -3664,7 +3689,7 @@ static void delayed_send(void *private)
+ 		mi->last_sent = timestamp();
+ 	}
  
--	ret = send_to(i2r[in ^ 1].multicast, buf->cur, buf->end - buf->cur, m->ai + (in ^ 1), false, 0, buf);
-+	ret = send_to(i2r[in ^ 1].multicast, buf->cur, buf->end - buf->cur, m->dest + (in ^ 1), false, 0, buf);
+-	ret = send_to(c, buf->cur, buf->end - buf->cur, &mi->ai, buf->imm_valid, buf->imm, buf);
++	ret = send_to(c, buf->cur, buf->end - buf->cur, &mi->dest, buf->imm_valid, buf->imm, buf);
+ 	if (!ret)
+ 		st(c, packets_bridged);
+ 	buf->mi = NULL;
+@@ -3831,7 +3856,7 @@ delayed_packet:
+ 		mi->last_sent = t;
+ 	}
+ 
+-	ret = send_to(ch_out, buf->cur, buf->end - buf->cur, &mi->ai, buf->imm_valid, buf->imm, buf);
++	ret = send_to(ch_out, buf->cur, buf->end - buf->cur, &mi->dest, buf->imm_valid, buf->imm, buf);
  
  	if (ret)
  		return;
-@@ -4789,9 +4814,9 @@ static void beacon_send(void)
+@@ -5106,9 +5131,9 @@ static void beacon_send(void *private)
  				if (sizeof(b) > MAX_INLINE_DATA) {
  					buf = alloc_buffer(i->multicast);
  					memcpy(buf->raw, &b, sizeof(b));
--					send_to(i->multicast, buf, sizeof(b), beacon_mc->ai + in, false, 0, buf);
-+					send_to(i->multicast, buf, sizeof(b), beacon_mc->dest + in, false, 0, buf);
+-					send_to(i->multicast, buf, sizeof(b), &beacon_mc->interface[in].ai, false, 0, buf);
++					send_to(i->multicast, buf, sizeof(b), &beacon_mc->interface[in].dest, false, 0, buf);
  				} else
--					send_inline(i->multicast, &b, sizeof(b), beacon_mc->ai + in, false, 0);
-+					send_inline(i->multicast, &b, sizeof(b), beacon_mc->dest + in, false, 0);
+-					send_inline(i->multicast, &b, sizeof(b), &beacon_mc->interface[in].ai, false, 0);
++					send_inline(i->multicast, &b, sizeof(b), &beacon_mc->interface[in].dest, false, 0);
  			}
  		}
  

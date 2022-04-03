@@ -2,7 +2,7 @@ Index: rdma-core/ib2roce/ib2roce.c
 ===================================================================
 --- rdma-core.orig/ib2roce/ib2roce.c
 +++ rdma-core/ib2roce/ib2roce.c
-@@ -279,18 +279,6 @@ struct rdma_channel {
+@@ -305,18 +305,6 @@ struct rdma_channel {
  };
  
  /*
@@ -21,7 +21,7 @@ Index: rdma-core/ib2roce/ib2roce.c
   * Address information for an endpoint.
   * ah points to the address stucture needed to send data to
   * this endpoint. The rest are basically keys to lookup
-@@ -326,6 +314,17 @@ static inline void setup_dest(struct des
+@@ -352,6 +340,17 @@ static inline void setup_dest(struct des
  	d->remote_qkey = remote_qkey;
  }
  
@@ -37,9 +37,9 @@ Index: rdma-core/ib2roce/ib2roce.c
 +};
 + 
  static struct i2r_interface {
+ 	/* Not changed when multithreading */
  	struct ibv_context *context;		/* Not for RDMA CM use */
- 	struct rdma_event_channel *rdma_events;
-@@ -896,7 +895,7 @@ static void pull(struct buf *buf, void *
+@@ -950,7 +949,7 @@ static void pull(struct buf *buf, void *
  
  static void beacon_received(struct buf *buf);
  
@@ -48,7 +48,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  
  static struct buf *buffers;
  
-@@ -2190,7 +2189,7 @@ static void resolve_end(struct rdma_unic
+@@ -2275,7 +2274,7 @@ static void resolve_end(struct rdma_unic
  		struct buf *buf;
  
  		while ((buf = fifo_get(&ru->pending)))		/* Send pending I/O */
@@ -57,7 +57,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  	} else
  		zap_channel(ru);
  
-@@ -2493,7 +2492,7 @@ static int send_inline(struct rdma_chann
+@@ -2587,7 +2586,7 @@ static int send_inline(struct rdma_chann
  /*
   * Send data to target using native RDMA structs relying on state in struct buf.
   */
@@ -66,7 +66,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  {
  	struct ibv_send_wr wr, *bad_send_wr;
  	struct ibv_sge sge;
-@@ -2512,9 +2511,9 @@ static int send_ud(struct rdma_channel *
+@@ -2606,9 +2605,9 @@ static int send_ud(struct rdma_channel *
  	wr.wr_id = (uint64_t)buf;
  
  	/* Get addr info  */
@@ -79,7 +79,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  
  	sge.length = buf->end - buf->cur;
  	sge.lkey = c->mr->lkey;
-@@ -2591,15 +2590,15 @@ static int send_to(struct rdma_channel *
+@@ -2688,15 +2687,15 @@ static int send_to(struct rdma_channel *
  }
  
  /* Send buffer based on state in struct buf. Unicast only */
@@ -98,7 +98,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  
  	return ret;
  }
-@@ -2712,7 +2711,7 @@ static void list_endpoints(struct i2r_in
+@@ -2809,7 +2808,7 @@ static void list_endpoints(struct i2r_in
  
  				while (f) {
  					n += snprintf(buf + n, sizeof(buf) - n, "[0x%x->%s:%x/%x]",
@@ -107,7 +107,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  
  					f = f->next;
  				}
-@@ -2732,13 +2731,11 @@ static void list_endpoints(struct i2r_in
+@@ -2829,13 +2828,11 @@ static void list_endpoints(struct i2r_in
   * This function only adds the forward. Check if there is an existing
   * forward before calling this function.
   */
@@ -123,7 +123,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  	f->source_qp = source_qp;
  
  	f->next = source->forwards;
-@@ -2756,7 +2753,7 @@ static struct forward *find_forward(stru
+@@ -2853,7 +2850,7 @@ static struct forward *find_forward(stru
  {
  	struct forward *f = source->forwards;
  
@@ -132,7 +132,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  		f = f->next;
  
  	return f;
-@@ -3822,10 +3819,11 @@ static void sidr_state_init(void)
+@@ -4086,10 +4083,11 @@ static void sidr_state_init(void)
   */
  static void send_mad(struct endpoint *e, struct buf *buf, void *mad_pos)
  {
@@ -145,9 +145,9 @@ Index: rdma-core/ib2roce/ib2roce.c
  }
  
  static const char *sidr_req(struct buf *buf, void *mad_pos)
-@@ -4004,11 +4002,18 @@ static const char * sidr_rep(struct buf
- 	if (find_forward(ss->source, (buf->c->i == i2r + INFINIBAND) ? NULL : ss->dest, ss->source_qp))
+@@ -4270,11 +4268,18 @@ static const char * sidr_rep(struct buf
  		return "Ignoring SIDR REQ since one is already pending";
+ 	}
  
 -	add_forward(ss->source, ss->source_qp, ss->dest, sr_qpn, sr_qkey);
 +	{
@@ -167,7 +167,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  
  	unlock();
  
-@@ -4310,11 +4315,13 @@ static void receive_ud(struct buf *buf)
+@@ -4578,11 +4583,13 @@ static void receive_ud(struct buf *buf)
  		/* Hmm... Not good. Maybe there is a wild chart entry if the source_qp was not determined yet */
  		f = find_forward(e, d, 0);
  		if (f) {
@@ -182,7 +182,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  		}
  
  		unlock();
-@@ -4330,12 +4337,12 @@ static void receive_ud(struct buf *buf)
+@@ -4598,12 +4605,12 @@ static void receive_ud(struct buf *buf)
  	 * if the value in immm matches the src_qp.... Maybe we should not do this by default ?
  	 */
  	if (ntohl(buf->imm) == w->src_qp)
@@ -198,7 +198,7 @@ Index: rdma-core/ib2roce/ib2roce.c
   	return;
   
  discard:
-@@ -4673,7 +4680,7 @@ static void status_write(void)
+@@ -4948,7 +4955,7 @@ static unsigned show_endpoints(char *b)
  
  				for (f = ep->forwards; f; f = f->next) {
  					n += snprintf(b + n, sizeof(buf) - n, " Q%d->%sQ%d",
@@ -207,7 +207,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  				}
  			}
  			offset += 20;
-@@ -4777,7 +4784,7 @@ static void send_buf_to(struct i2r_inter
+@@ -5100,7 +5107,7 @@ static void send_buf_to(struct i2r_inter
  			return;
  
  		case UC_CONNECTED: /* Channel is open. We can send now */

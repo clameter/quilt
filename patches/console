@@ -232,7 +232,7 @@ Index: rdma-core/ib2roce/ib2roce.c
 +	char *p;
 +	unsigned len;
 +
-+	ret = read(0, in, sizeof(in));
++	ret = read(STDIN_FILENO, in, sizeof(in));
 +
 +	if (ret == 0) {
 +		printf("\n");
@@ -294,7 +294,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  	if (background)
  		status_fd = open("ib2roce-status", O_CREAT | O_RDWR | O_TRUNC,  S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
 +	else {
-+		register_callback(console_input, 0, NULL);
++		register_callback(console_input, STDIN_FILENO, NULL);
 +		add_event(timestamp() + seconds(2), prompt, NULL, "Console Prompt");
 +	}
  

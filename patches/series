@@ -96,6 +96,7 @@ refactor_status_write
 dont_exit_from_enable
 console
 add_continuous_cmd
+move_sched
 get_rid_of_ah_info
 add_struct_dest_to_unify_write
 socket

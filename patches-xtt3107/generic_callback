@@ -1,0 +1,151 @@
+Index: rdma-core/ib2roce/ib2roce.c
+===================================================================
+--- rdma-core.orig/ib2roce/ib2roce.c
++++ rdma-core/ib2roce/ib2roce.c
+@@ -261,7 +261,7 @@ enum channel_type { channel_rdmacm, chan
+ struct buf;
+ 
+ typedef void receive_callback(struct buf *);
+-
++typedef void event_callback(void *);
+ 
+ /*
+  * Channel data stucture,
+@@ -406,7 +406,7 @@ static inline void st(struct rdma_channe
+ }
+ 
+ /* Forwards */
+-static void add_event(unsigned long time_in_ms, void (*callback));
++static void add_event(unsigned long time_in_ms, event_callback *callback, void *private);
+ static struct rdma_unicast *new_rdma_unicast(struct i2r_interface *i, struct sockaddr_in *sin);
+ static void register_callback(void (*callback)(void *), int fd, void *private);
+ static void handle_receive_packet(void *private);
+@@ -4750,7 +4750,7 @@ static int channel_stats(char *b, struct
+ }
+ 
+ 
+-static void status_write(void)
++static void status_write(void *private)
+ {
+ 	static char b[10000];
+ 	struct i2r_interface *i;
+@@ -4844,7 +4844,7 @@ static void status_write(void)
+ 		close(fd);
+ 		update_requested = false;
+ 	}
+-	add_event(timestamp() + seconds(60), status_write);
++	add_event(timestamp() + seconds(60), status_write, NULL);
+ }
+ 
+ #define BEACON_MCS 500
+@@ -4983,7 +4983,7 @@ static void send_buf_to(struct i2r_inter
+ 	}
+ }
+ 
+-static void beacon_send(void)
++static void beacon_send(void *private)
+ {
+ 	struct beacon_info b;
+ 	struct buf *buf;
+@@ -5025,7 +5025,7 @@ static void beacon_send(void)
+ 		send_buf_to(i, buf, beacon_sin);
+ 
+ 	}
+-	add_event(timestamp() + seconds(10), beacon_send);
++	add_event(timestamp() + seconds(10), beacon_send, NULL);
+ }
+ 
+ static void beacon_setup(const char *opt_arg)
+@@ -5058,19 +5058,21 @@ static void beacon_setup(const char *opt
+ 		} else
+ 			beacon_mc = m;
+ 	}
+-	add_event(timestamp() + ONE_SECOND, beacon_send);
++	add_event(timestamp() + ONE_SECOND, beacon_send, NULL);
+ }
+ 
+ /* Events are timed according to nanoseconds in the current epoch */
+ struct timed_event {
+ 	uint64_t time;		/* When should it occur */
+-	void (*callback)(void);		/* function to run */
++	event_callback *callback;		/* function to run */
++	void *private;			/* The parameter to the function */
+ 	struct timed_event *next;	/* The following event */
+ };
+ 
+-static struct timed_event *next_event;
++/* Timer queue for each thread */
++struct timed_event *next_event;
+ 
+-static void add_event(uint64_t time, void (*callback))
++static void add_event(uint64_t time, event_callback callback, void *private)
+ {
+ 	struct timed_event *t;
+ 	struct timed_event *prior = NULL;
+@@ -5091,14 +5093,14 @@ static void add_event(uint64_t time, voi
+ 		next_event = new_event;
+ }
+ 
+-static void check_joins(void)
++static void check_joins(void *private)
+ {
+ 	struct i2r_interface *i;
+ 
+ 	/* Maintenance tasks */
+ 	if (nr_mc > active_mc) {
+ 		join_processing();
+-		add_event(timestamp() + ONE_SECOND, check_joins);
++		add_event(timestamp() + ONE_SECOND, check_joins, NULL);
+ 	} else {
+ 		/*
+ 		 * All active so start listening. This means we no longer
+@@ -5116,7 +5118,7 @@ static void check_joins(void)
+ 	}
+ }
+ 
+-static void logging(void)
++static void logging(void *private)
+ {
+ 	char buf[100];
+ 	char buf2[150];
+@@ -5169,7 +5171,7 @@ static void logging(void)
+ 	}
+ 
+ 	logg(LOG_NOTICE, "%s. Groups=%d/%d. Packets=%s\n", events, active_mc, nr_mc, counts);
+-	add_event(timestamp() + interval, logging);
++	add_event(timestamp() + interval, logging, NULL);
+ 
+ 	list_endpoints(i2r + INFINIBAND);
+ 	list_endpoints(i2r + ROCE);
+@@ -5207,10 +5209,10 @@ static void setup_timed_events(void)
+ 	t = timestamp();
+ 
+ 	if (background)
+-		add_event(t + seconds(30), status_write);
++		add_event(t + seconds(30), status_write, NULL);
+ 
+-	add_event(t + ONE_SECOND, logging);
+-	add_event(t + milliseconds(100), check_joins);
++	add_event(t + ONE_SECOND, logging, NULL);
++	add_event(t + milliseconds(100), check_joins, NULL);
+ }
+ 
+ static void arm_channels(struct core_info *core)
+@@ -5273,7 +5275,7 @@ loop:
+ 
+ 			te = next_event;
+ 			next_event = next_event->next;
+-			te->callback();
++			te->callback(te->private);
+ 			free(te);
+ 			goto loop;
+ 		}
+@@ -5783,7 +5785,7 @@ int main(int argc, char **argv)
+ 	if (background)
+ 		close(status_fd);
+ 
+-	logging();
++	logging(NULL);
+ 	shutdown_roce();
+ 	shutdown_ib();
+ 

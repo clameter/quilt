@@ -1,0 +1,113 @@
+Index: rdma-core/ib2roce/ib2roce.c
+===================================================================
+--- rdma-core.orig/ib2roce/ib2roce.c
++++ rdma-core/ib2roce/ib2roce.c
+@@ -5259,14 +5259,13 @@ static void check_joins(void *private)
+ 	}
+ }
+ 
+-static void logging(void *private)
++static void brief_status(void)
+ {
+ 	char buf[100];
+ 	char buf2[150];
+ 	char counts[200];
+ 
+ 	unsigned n = 0;
+-	uint64_t interval = seconds(5);
+ 	const char *events;
+ 
+ 	for(struct timed_event *z = next_event; z; z = z->next)
+@@ -5279,7 +5278,6 @@ static void logging(void *private)
+ 
+ 	if (n == 0) {
+ 		events = "No upcoming events";
+-		interval = seconds(10);
+ 	} else {
+ 		snprintf(buf2, sizeof(buf2), "Events in %s", buf);
+ 		events = buf2;
+@@ -5315,13 +5313,18 @@ static void logging(void *private)
+ 	}
+ 
+ 	logg(LOG_NOTICE, "%s. Groups=%d/%d. Packets=%s\n", events, active_mc, nr_mc, counts);
+-	add_event(timestamp() + interval, logging, NULL, "Brief Status");
+ 
+ 	list_endpoints(i2r + INFINIBAND);
+ 	list_endpoints(i2r + ROCE);
+ 
+ }
+ 
++static void logging(void *private)
++{
++	brief_status();
++	add_event(timestamp() + seconds(10), logging, NULL, "Brief Status");
++}
++
+ /*
+  * Logic to support building a pollfd table for the event loop
+  */
+@@ -5352,10 +5355,11 @@ static void setup_timed_events(void)
+ 
+ 	t = timestamp();
+ 
+-	if (background)
++	if (background) {
+ 		add_event(t + seconds(30), status_write, NULL, "Write Status File");
++		logging(NULL);
++	}
+ 
+-	add_event(t + ONE_SECOND, logging, NULL, "Brief Status Display");
+ 	add_event(t + milliseconds(100), check_joins, NULL, "Check Multicast Joins");
+ }
+ 
+@@ -5998,7 +6002,7 @@ static void multicast_cmd(char *paramete
+ }
+ 
+ static void statuscmd(char *parameters) {
+-	logging(NULL);
++	brief_status();
+ }
+ 
+ static void enablecmd(char *parameters) {
+@@ -6020,6 +6024,33 @@ static void core_cmd(char *parameters) {
+ 	}
+ }
+ 
++static int log_interval;
++
++static void continous(void *private)
++{
++	printf("\n");
++	brief_status();
++
++	if (log_interval)
++		add_event(timestamp() + log_interval * ONE_SECOND,
++				continous, NULL, "Continous Logging");
++}
++
++static void continous_cmd(char *parameters)
++{
++	int old_interval = log_interval;
++
++	if (!parameters) {
++		printf("Continuous logging interval is %d seconds.\n", log_interval);
++		return;
++	}
++
++	log_interval = atoi(parameters);
++
++	if (!old_interval && log_interval)
++		continous(NULL);
++}
++
+ static struct concom {
+ 	const char *name;
+ 	bool prompt;
+@@ -6027,6 +6058,7 @@ static struct concom {
+ 	const char *description;
+ 	void (*callback)(char *parameters);
+ } concoms[] = {
++{ "continuous",	false,	1,	"Print continous status in specified interval",	continous_cmd },
+ { "cores",	true,	1,	"Setup and list core configuration",		core_cmd },
+ { "disable",	true,	1,	"Disable optional features",			disablecmd },
+ { "enable",	true,	1,	"Setup optional features and list them",	enablecmd },

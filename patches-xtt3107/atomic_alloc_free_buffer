@@ -2,7 +2,7 @@ Index: rdma-core/ib2roce/ib2roce.c
 ===================================================================
 --- rdma-core.orig/ib2roce/ib2roce.c
 +++ rdma-core/ib2roce/ib2roce.c
-@@ -929,7 +929,46 @@ static struct buf *buffers;
+@@ -932,7 +932,47 @@ static struct buf *buffers;
  
  static struct buf *nextbuffer;	/* Pointer to next available RDMA buffer */
  
@@ -35,6 +35,7 @@ Index: rdma-core/ib2roce/ib2roce.c
 +
 +	buf->free = false;
 +	buf->c = c;
++	buf->refcount = 1;
 +
 +#ifdef DEBUG
 +	buf->next = NULL;
@@ -50,7 +51,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  {
  #ifdef DEBUG
  	memset(buf->raw, 0, DATA_SIZE);
-@@ -938,18 +977,13 @@ static void __free_buffer(struct buf *bu
+@@ -941,18 +981,13 @@ static void __free_buffer(struct buf *bu
  		abort();
  
  	buf->free = true;
@@ -74,7 +75,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  static void __get_buf(struct buf *buf)
  {
  	if (!buf->refcount)
-@@ -1048,32 +1082,6 @@ static void init_buf(void)
+@@ -1051,33 +1086,6 @@ static void init_buf(void)
  		free_buffer(&buffers[i-1]);
  }
  
@@ -91,6 +92,7 @@ Index: rdma-core/ib2roce/ib2roce.c
 -		nextbuffer = buf->next;
 -		buf->free = false;
 -		buf->c = c;
+-		buf->refcount = 1;
 -	}
 -	unlock();
 -

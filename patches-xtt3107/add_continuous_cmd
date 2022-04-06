@@ -2,7 +2,7 @@ Index: rdma-core/ib2roce/ib2roce.c
 ===================================================================
 --- rdma-core.orig/ib2roce/ib2roce.c
 +++ rdma-core/ib2roce/ib2roce.c
-@@ -5259,14 +5259,13 @@ static void check_joins(void *private)
+@@ -5267,14 +5267,13 @@ static void check_joins(void *private)
  	}
  }
  
@@ -18,7 +18,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  	const char *events;
  
  	for(struct timed_event *z = next_event; z; z = z->next)
-@@ -5279,7 +5278,6 @@ static void logging(void *private)
+@@ -5287,7 +5286,6 @@ static void logging(void *private)
  
  	if (n == 0) {
  		events = "No upcoming events";
@@ -26,7 +26,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  	} else {
  		snprintf(buf2, sizeof(buf2), "Events in %s", buf);
  		events = buf2;
-@@ -5315,13 +5313,18 @@ static void logging(void *private)
+@@ -5323,13 +5321,18 @@ static void logging(void *private)
  	}
  
  	logg(LOG_NOTICE, "%s. Groups=%d/%d. Packets=%s\n", events, active_mc, nr_mc, counts);
@@ -46,7 +46,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  /*
   * Logic to support building a pollfd table for the event loop
   */
-@@ -5352,10 +5355,11 @@ static void setup_timed_events(void)
+@@ -5360,10 +5363,11 @@ static void setup_timed_events(void)
  
  	t = timestamp();
  
@@ -60,7 +60,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  	add_event(t + milliseconds(100), check_joins, NULL, "Check Multicast Joins");
  }
  
-@@ -5998,7 +6002,7 @@ static void multicast_cmd(char *paramete
+@@ -6005,7 +6009,7 @@ static void multicast_cmd(char *paramete
  }
  
  static void statuscmd(char *parameters) {
@@ -69,7 +69,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  }
  
  static void enablecmd(char *parameters) {
-@@ -6020,6 +6024,33 @@ static void core_cmd(char *parameters) {
+@@ -6027,6 +6031,33 @@ static void core_cmd(char *parameters) {
  	}
  }
  
@@ -103,7 +103,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  static struct concom {
  	const char *name;
  	bool prompt;
-@@ -6027,6 +6058,7 @@ static struct concom {
+@@ -6034,6 +6065,7 @@ static struct concom {
  	const char *description;
  	void (*callback)(char *parameters);
  } concoms[] = {

@@ -2,7 +2,7 @@ Index: rdma-core/ib2roce/ib2roce.c
 ===================================================================
 --- rdma-core.orig/ib2roce/ib2roce.c
 +++ rdma-core/ib2roce/ib2roce.c
-@@ -883,29 +883,24 @@ struct buf {
+@@ -880,29 +880,24 @@ struct buf {
  			struct buf *next;	/* Next free buffer */
  			bool free;
  			unsigned refcount;	/* Refcount */
@@ -35,7 +35,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  		};
  		uint8_t meta[META_SIZE];
  	};
-@@ -3563,17 +3558,18 @@ static struct endpoint *buf_to_ep(struct
+@@ -3567,17 +3562,18 @@ static struct endpoint *buf_to_ep(struct
  			return NULL;
  		}
  		if (buf->grh_valid) {
@@ -56,7 +56,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  					logg(LOG_NOTICE, "Extracted IP address from PGM header: %s %s\n",
  						c->text, inet_ntoa(addr));
  				}
-@@ -4098,7 +4094,7 @@ err:
+@@ -4105,7 +4101,7 @@ err:
   * the EP will be properly forwarded and also the other
   * way around.
   */
@@ -65,7 +65,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  {
  	struct sidr_rep *sr = (void *)buf->cur;
  	struct sidr_state *ss;
-@@ -4108,9 +4104,9 @@ static const char * sidr_rep(struct buf
+@@ -4115,9 +4111,9 @@ static const char * sidr_rep(struct buf
  
  	
  	logg(LOG_NOTICE, "SIDR_REP: %s method=%s status=%s attr_id=%s attr_mod=%x ServiceId=%lx ReqId=%x Q_KEY=%x QPN=%d Status=%x\n",
@@ -78,7 +78,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  		be64toh(sr->service_id), ntohl(sr->request_id), sr_qkey, sr_qpn, sr->status);
  
  	if (sr->status)
-@@ -4172,6 +4168,8 @@ static void receive_raw(struct buf *buf)
+@@ -4179,6 +4175,8 @@ static void receive_raw(struct buf *buf)
  	struct bth bth = { };
  	struct deth deth;	/* BTH subheader */
  	char header[200] = "";
@@ -87,7 +87,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  
  	if (i == i2r + INFINIBAND) {
  		__be16 lrh[4];
-@@ -4244,8 +4242,6 @@ static void receive_raw(struct buf *buf)
+@@ -4251,8 +4249,6 @@ static void receive_raw(struct buf *buf)
  			ethertype = ETHERTYPE_IP;
  		}
  
@@ -96,7 +96,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  		if (memcmp(i->if_mac, buf->e.ether_shost, ETH_ALEN) == 0) {
  
  			reason = "-Loopback";
-@@ -4306,10 +4302,9 @@ static void receive_raw(struct buf *buf)
+@@ -4313,10 +4309,9 @@ static void receive_raw(struct buf *buf)
  			if (!buf->ip_csum_ok)
  				logg(LOG_NOTICE, "TCP/UDP CSUM not valid on raw RDMA channel %s\n", c->text);
  
@@ -109,7 +109,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  
  				reason = "Not the ROCE UDP port";
  				goto discard;
-@@ -4340,9 +4335,11 @@ static void receive_raw(struct buf *buf)
+@@ -4347,9 +4342,11 @@ static void receive_raw(struct buf *buf)
  	w->src_qp = __deth_sqp(&deth);
  
  	if (__bth_opcode(&bth) == IB_OPCODE_UD_SEND_ONLY_WITH_IMMEDIATE) {
@@ -123,7 +123,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  	}
  
  	buf->cur += __bth_pad(&bth);
-@@ -4369,29 +4366,29 @@ static void receive_raw(struct buf *buf)
+@@ -4376,29 +4373,29 @@ static void receive_raw(struct buf *buf)
  	mad_pos = buf->cur;
  
  	/* Start MAD payload */
@@ -161,7 +161,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  		if (reason)
  			goto discard;
  		return;
-@@ -4489,6 +4486,7 @@ static void receive_qp1(struct buf *buf)
+@@ -4496,6 +4493,7 @@ static void receive_qp1(struct buf *buf)
  	const char *reason;
  	struct ibv_wc *w = buf->w;
  	void *mad_pos;
@@ -169,7 +169,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  
  	learn_source_address(buf);
  
-@@ -4498,28 +4496,28 @@ static void receive_qp1(struct buf *buf)
+@@ -4505,28 +4503,28 @@ static void receive_qp1(struct buf *buf)
  
  	mad_pos = buf->cur;
  
@@ -206,7 +206,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  		if (reason)
  			goto discard;
  		return;
-@@ -4537,7 +4535,7 @@ discard:
+@@ -4544,7 +4542,7 @@ discard:
  
  static void reset_flags(struct buf *buf)
  {

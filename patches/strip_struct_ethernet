@@ -2,7 +2,7 @@ Index: rdma-core/ib2roce/ib2roce.c
 ===================================================================
 --- rdma-core.orig/ib2roce/ib2roce.c
 +++ rdma-core/ib2roce/ib2roce.c
-@@ -899,7 +899,6 @@ struct buf {
+@@ -897,7 +897,6 @@ struct buf {
  
  			/* Structs pulled out of the frame */
  			struct ibv_grh grh;
@@ -10,7 +10,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  			struct iphdr ip;
  		};
  		uint8_t meta[META_SIZE];
-@@ -4233,16 +4232,17 @@ static void receive_raw(struct buf *buf)
+@@ -4236,16 +4235,17 @@ static void receive_raw(struct buf *buf)
  		char source_str[30];
  		char dest_str[30];
  		struct in_addr source, dest;
@@ -31,7 +31,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  
  			reason = "-Loopback";
  			goto discard;
-@@ -4294,7 +4294,7 @@ static void receive_raw(struct buf *buf)
+@@ -4297,7 +4297,7 @@ static void receive_raw(struct buf *buf)
  
  			}
  
@@ -40,7 +40,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  				reason = "-Multicast on RAW channel";
  				goto discard;
  			}
-@@ -4656,6 +4656,7 @@ static void handle_receive_packet(void *
+@@ -4659,6 +4659,7 @@ static void handle_receive_packet(void *
  	unsigned ethertype;
  	ssize_t len;
  	struct buf *buf = alloc_buffer(c);
@@ -48,7 +48,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  
  	len = recv(c->fh, buf->raw, DATA_SIZE, 0);
  
-@@ -4676,9 +4677,9 @@ static void handle_receive_packet(void *
+@@ -4679,9 +4680,9 @@ static void handle_receive_packet(void *
  	buf->end = buf->raw + w.byte_len;
  	buf->w = &w;
  	reset_flags(buf);

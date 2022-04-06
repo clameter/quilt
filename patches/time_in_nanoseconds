@@ -19,7 +19,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  
  #define MIN(a,b) (((a)<(b))?(a):(b))
  
-@@ -113,16 +114,23 @@ static int drop_packets = 0;		/* Packet
+@@ -113,18 +114,27 @@ static int drop_packets = 0;		/* Packet
  static int rate = 0;			/* Limit sending rate */
  static int swrate = 0;			/* Software delay per message */
  
@@ -45,8 +45,12 @@ Index: rdma-core/ib2roce/ib2roce.c
 +
  #define cpu_relax()	asm volatile("rep; nop")
  
++thread_local uint64_t now;		/* We do not want contention on this one */
++
  __attribute__ ((format (printf, 2, 3)))
-@@ -254,7 +262,7 @@ enum channel_type { channel_rdmacm, chan
+ static void logg(int prio, const char *fmt, ...)
+ {
+@@ -250,7 +260,7 @@ enum channel_type { channel_rdmacm, chan
  struct buf;
  
  typedef void receive_callback(struct buf *);
@@ -55,7 +59,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  
  /*
   * Channel data stucture,
-@@ -399,7 +407,8 @@ static inline void st(struct rdma_channe
+@@ -396,7 +406,8 @@ static inline void st(struct rdma_channe
  }
  
  /* Forwards */
@@ -65,7 +69,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  static struct rdma_unicast *new_rdma_unicast(struct i2r_interface *i, struct sockaddr_in *sin);
  static void register_callback(void (*callback)(void *), int fd, void *private);
  static void handle_receive_packet(void *private);
-@@ -4736,7 +4745,7 @@ static int channel_stats(char *b, struct
+@@ -4743,7 +4754,7 @@ static int channel_stats(char *b, struct
  }
  
  
@@ -74,7 +78,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  {
  	static char b[10000];
  	struct i2r_interface *i;
-@@ -4830,7 +4839,7 @@ static void status_write(void)
+@@ -4837,7 +4848,7 @@ static void status_write(void)
  		close(fd);
  		update_requested = false;
  	}
@@ -83,7 +87,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  }
  
  #define BEACON_MCS 500
-@@ -4969,7 +4978,7 @@ static void send_buf_to(struct i2r_inter
+@@ -4976,7 +4987,7 @@ static void send_buf_to(struct i2r_inter
  	}
  }
  
@@ -92,7 +96,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  {
  	struct beacon_info b;
  	struct buf *buf;
-@@ -5011,7 +5020,7 @@ static void beacon_send(void)
+@@ -5018,7 +5029,7 @@ static void beacon_send(void)
  		send_buf_to(i, buf, beacon_sin);
  
  	}
@@ -101,7 +105,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  }
  
  static void beacon_setup(const char *opt_arg)
-@@ -5044,19 +5053,24 @@ static void beacon_setup(const char *opt
+@@ -5051,19 +5062,22 @@ static void beacon_setup(const char *opt
  		} else
  			beacon_mc = m;
  	}
@@ -122,17 +126,15 @@ Index: rdma-core/ib2roce/ib2roce.c
  };
  
 -static struct timed_event *next_event;
-+thread_local uint64_t now;		/* We do not want contention on this one */
- 
--static void add_event(unsigned long time, void (*callback))
 +/* Event queues for each of the threads */
 +thread_local static struct timed_event *next_event;
-+
+ 
+-static void add_event(unsigned long time, void (*callback))
 +static void add_event(uint64_t time, event_callback *callback, void *private, const char *text)
  {
  	struct timed_event *t;
  	struct timed_event *prior = NULL;
-@@ -5065,6 +5079,8 @@ static void add_event(unsigned long time
+@@ -5072,6 +5086,8 @@ static void add_event(unsigned long time
  	new_event = calloc(1, sizeof(struct timed_event));
  	new_event->time = time;
  	new_event->callback = callback;
@@ -141,7 +143,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  
  	for(t = next_event; t && time > t->time; t = t->next)
  		prior = t;
-@@ -5077,14 +5093,45 @@ static void add_event(unsigned long time
+@@ -5084,14 +5100,51 @@ static void add_event(unsigned long time
  		next_event = new_event;
  }
  
@@ -160,10 +162,10 @@ Index: rdma-core/ib2roce/ib2roce.c
 + */
 +static uint64_t run_events(void)
 +{
++	now = timestamp();
 +	while (next_event) {
 +		struct timed_event *te = next_event;
-+
-+		now = timestamp();
++		uint64_t old_now;
 +
 +		if (te->time > now + ONE_MICROSECOND)
 +			return te->time - now;
@@ -171,6 +173,12 @@ Index: rdma-core/ib2roce/ib2roce.c
 +		/* Time is up for an event */
 +		next_event = te->next;
 +		te->callback(te->private);
++		old_now = now;
++		now = timestamp();
++		if (now - old_now > ONE_MILLISECOND)
++			logg(LOG_ERR, "Callback %s took %ld nanoseconds which is longer than a millisecond\n",
++				te->text, now-old_now);
++
 +		free(te);
 +	}
 +	return 0;
@@ -189,7 +197,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  	} else {
  		/*
  		 * All active so start listening. This means we no longer
-@@ -5102,18 +5149,18 @@ static void check_joins(void)
+@@ -5109,18 +5162,18 @@ static void check_joins(void)
  	}
  }
  
@@ -211,7 +219,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  
  	if (n > 0)
  		buf[n -1] = 0;
-@@ -5122,7 +5169,7 @@ static void logging(void)
+@@ -5129,7 +5182,7 @@ static void logging(void)
  
  	if (n == 0) {
  		events = "No upcoming events";
@@ -220,7 +228,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  	} else {
  		snprintf(buf2, sizeof(buf2), "Events in %s", buf);
  		events = buf2;
-@@ -5155,7 +5202,7 @@ static void logging(void)
+@@ -5162,7 +5215,7 @@ static void logging(void)
  	}
  
  	logg(LOG_NOTICE, "%s. Groups=%d/%d. Packets=%s\n", events, active_mc, nr_mc, counts);
@@ -229,7 +237,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  
  	list_endpoints(i2r + INFINIBAND);
  	list_endpoints(i2r + ROCE);
-@@ -5188,15 +5235,15 @@ static void register_callback(void (*cal
+@@ -5195,15 +5248,15 @@ static void register_callback(void (*cal
  
  static void setup_timed_events(void)
  {
@@ -249,7 +257,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  }
  
  static void arm_channels(struct core_info *core)
-@@ -5235,48 +5282,34 @@ static void arm_channels(struct core_inf
+@@ -5242,48 +5295,34 @@ static void arm_channels(struct core_inf
  
  static int event_loop(void)
  {
@@ -315,7 +323,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  
  	if (terminated)
  		goto out;
-@@ -5769,7 +5802,6 @@ int main(int argc, char **argv)
+@@ -5775,7 +5814,6 @@ int main(int argc, char **argv)
  	if (background)
  		close(status_fd);
  

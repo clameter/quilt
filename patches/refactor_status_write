@@ -2,7 +2,7 @@ Index: rdma-core/ib2roce/ib2roce.c
 ===================================================================
 --- rdma-core.orig/ib2roce/ib2roce.c
 +++ rdma-core/ib2roce/ib2roce.c
-@@ -4845,32 +4845,31 @@ static int channel_stats(char *b, struct
+@@ -4875,32 +4875,31 @@ static int channel_stats(char *b, struct
  	return n;
  }
  
@@ -52,7 +52,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  
  	for(buf = buffers; buf < buffers + nr_buffers; buf++)
  		if (buf->free)
-@@ -4890,17 +4889,14 @@ static void status_write(void *private)
+@@ -4920,17 +4919,14 @@ static void status_write(void *private)
  			mc_text[m->interface[ROCE].status],
  			m->interface[ROCE].sendonly ? "Sendonly" : "",
  			m->interface[ROCE].pending);
@@ -77,7 +77,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  
  	for(i = i2r; i < i2r + NR_INTERFACES; i++)
  		if (i->context && i->ep) {
-@@ -4934,7 +4930,35 @@ static void status_write(void *private)
+@@ -4964,7 +4960,35 @@ static void status_write(void *private)
  			offset += 20;
  		}
  	}

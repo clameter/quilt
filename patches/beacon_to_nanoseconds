@@ -2,16 +2,7 @@ Index: rdma-core/ib2roce/ib2roce.c
 ===================================================================
 --- rdma-core.orig/ib2roce/ib2roce.c
 +++ rdma-core/ib2roce/ib2roce.c
-@@ -133,6 +133,8 @@ static uint64_t timestamp(void)
- 
- #define cpu_relax()	asm volatile("rep; nop")
- 
-+uint64_t now;
-+
- __attribute__ ((format (printf, 2, 3)))
- static void logg(int prio, const char *fmt, ...)
- {
-@@ -4858,7 +4860,7 @@ struct beacon_info {
+@@ -4867,7 +4867,7 @@ struct beacon_info {
  	bool infiniband;
  	uint16_t beacon_port;
  	struct in_addr beacon_mc;
@@ -20,7 +11,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  	unsigned gateway_qp;
  	struct in_addr bridge_addr;		/* Where is the local bridge */
  	struct in_addr to_addr;			/* To which address is it bridging */
-@@ -4870,20 +4872,6 @@ struct beacon_info {
+@@ -4879,20 +4879,6 @@ struct beacon_info {
  struct mc *beacon_mc;		/* == NULL if unicast */
  struct sockaddr_in *beacon_sin;
  
@@ -41,7 +32,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  static void prep_beacon_struct(struct i2r_interface *i, struct beacon_info *b)
  {
  	enum interfaces in = i - i2r;
-@@ -4911,22 +4899,20 @@ static void beacon_received(struct buf *
+@@ -4920,22 +4906,20 @@ static void beacon_received(struct buf *
  {
  	struct beacon_info *b = (struct beacon_info *)buf->cur;
  	char bridge[40];
@@ -68,7 +59,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  }
  
  /* A mini router follows */
-@@ -4989,7 +4975,7 @@ static void beacon_send(void *private)
+@@ -4998,7 +4982,7 @@ static void beacon_send(void *private)
  		for(in = 0; in < NR_INTERFACES; in++) {
  			struct i2r_interface *i = i2r + in;
  			prep_beacon_struct(i, &b);
@@ -77,7 +68,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  
  
  			if (i->context && beacon_mc->status[in] == MC_JOINED) {
-@@ -5011,6 +4997,7 @@ static void beacon_send(void *private)
+@@ -5020,6 +5004,7 @@ static void beacon_send(void *private)
  			return;
  		}
  		buf = alloc_buffer(i->multicast);
@@ -85,12 +76,3 @@ Index: rdma-core/ib2roce/ib2roce.c
  		memcpy(buf->raw, &b, sizeof(b));
  
  		reset_flags(buf);
-@@ -5065,8 +5052,6 @@ struct timed_event {
- 	const char *text;
- };
- 
--thread_local uint64_t now;		/* We do not want contention on this one */
--
- /* Event queues for each of the threads */
- thread_local static struct timed_event *next_event;
- 

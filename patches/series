@@ -113,6 +113,7 @@ cleanup_busyloop
 queue_writes
 ring
 buffer
+loglevel
 raw
 ru
 move_sched

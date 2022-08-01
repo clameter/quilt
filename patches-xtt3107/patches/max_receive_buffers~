@@ -1,0 +1,129 @@
+Index: rdma-core/ib2roce/ib2roce.c
+===================================================================
+--- rdma-core.orig/ib2roce/ib2roce.c
++++ rdma-core/ib2roce/ib2roce.c
+@@ -195,6 +195,7 @@ struct rdma_channel {
+ 	struct ibv_pd *pd;
+ 	struct ibv_flow *flow;
+ 	unsigned int active_receive_buffers;
++	unsigned int max_receive_buffers;
+ 	unsigned int nr_cq;
+ 	unsigned stats[nr_stats];
+ 	enum channel_type type;
+@@ -1005,17 +1006,17 @@ static char *pgm_dump(struct pgm_header
+ /*
+  * Handling of RDMA work requests
+  */
+-static int post_receive(struct rdma_channel *c, int limit)
++static void post_receive(struct rdma_channel *c)
+ {
+ 	struct ibv_recv_wr recv_wr, *recv_failure;
+ 	struct ibv_sge sge;
+ 	int ret = 0;
+ 
+-	if (!nextbuffer)
+-		return -ENOMEM;
++	if (!c || !nextbuffer)
++		return;
+ 
+-	if (c->active_receive_buffers >= limit)
+-		return 0;
++	if (c->active_receive_buffers >= c->max_receive_buffers)
++		return;
+ 
+ 	recv_wr.next = NULL;
+ 	recv_wr.sg_list = &sge;
+@@ -1024,14 +1025,13 @@ static int post_receive(struct rdma_chan
+ 	sge.length = DATA_SIZE;
+ 	sge.lkey = c->mr->lkey;
+ 
+-	while (c->active_receive_buffers < limit) {
++	while (c->active_receive_buffers < c->max_receive_buffers) {
+ 
+ 		struct buf *buf = alloc_buffer(c);
+ 
+ 		if (!buf) {
+-			logg(LOG_NOTICE, "No free buffers left\n");
+-			ret = -ENOMEM;
+-			break;
++			logg(LOG_WARNING, "%s: No free buffers left\n", c->text);
++			return;
+ 		}
+ 
+ 		/* Use the buffer address for the completion handler */
+@@ -1041,38 +1041,18 @@ static int post_receive(struct rdma_chan
+ 		if (ret) {
+ 			free_buffer(buf);
+ 			logg(LOG_WARNING, "ibv_post_recv failed: %s:%s\n", c->text, errname());
+-			break;
++			return;
+                 }
+ 		c->active_receive_buffers++;
+ 	}
+-	return ret;
+ }
+ 
+-static int post_receive_buffers(struct i2r_interface *i)
++static void post_receive_buffers(struct i2r_interface *i)
+ {
+-	int ret = 0;
+-
+-	if (!nextbuffer)
+-		return -EAGAIN;
+-
+-	ret = post_receive(i->multicast, i->multicast->nr_cq / 2);
+-	if (ret)
+-		goto out;
+-
+-	if (i->raw && i->raw->type == channel_raw)
+-		ret = post_receive(i->raw, 100);
+-
+-	if (ret)
+-		goto out;
+-
+-	if (i->qp1)
+-		ret = post_receive(i->qp1, 10);
+-
+-	if (i->ud)
+-		ret = post_receive(i->ud, 100);
+-
+-out:
+-	return ret;
++	post_receive(i->multicast);
++	post_receive(i->raw);
++	post_receive(i->qp1);
++	post_receive(i->ud);
+ }
+ 
+ 
+@@ -1893,7 +1873,7 @@ static void handle_rdma_event(void *priv
+ 
+ 				allocate_rdmacm_qp(ru->c, 100, false);
+ 
+-				post_receive(ru->c, 50);
++				post_receive(ru->c);
+ 				ibv_req_notify_cq(ru->c->cq, 0);
+ 
+ 				if (rdma_connect(ru->c->id, &rcp) < 0) {
+@@ -1931,8 +1911,7 @@ static void handle_rdma_event(void *priv
+ 				if (allocate_rdmacm_qp(c, 100, false))
+ 					goto err;
+ 
+-				if (post_receive(c, 50))
+-					goto err;
++				post_receive(c);
+ 
+ 				ibv_req_notify_cq(c->cq, 0);
+ 
+@@ -3575,9 +3554,9 @@ static void handle_comp_event(void *priv
+ 		}
+ 	}
+ 
+-exit:
+ 	/* Since we freed some buffers up we may be able to post more of them */
+-	post_receive_buffers(i);
++	post_receive(c);
++exit:
+ }
+ 
+ /* Special handling using raw socket */

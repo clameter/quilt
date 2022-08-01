@@ -1,0 +1,448 @@
+Index: rdma-core/ib2roce/ib2roce.c
+===================================================================
+--- rdma-core.orig/ib2roce/ib2roce.c
++++ rdma-core/ib2roce/ib2roce.c
+@@ -138,7 +138,7 @@ static uint64_t timestamp(void)
+ 
+ #define cpu_relax()	asm volatile("rep; nop")
+ 
+-uint64_t now;
++thread_local uint64_t now;
+ 
+ __attribute__ ((format (printf, 2, 3)))
+ static void logg(int prio, const char *fmt, ...)
+@@ -236,7 +236,7 @@ struct mgid_signature *mgid_mode = mgid_
+  */
+ 
+ #define MAX_GID 20
+-#define MAX_INLINE_DATA 64
++#define MAX_INLINE_DATA 32
+ 
+ static char *ib_name, *roce_name;
+ 
+@@ -253,14 +253,10 @@ enum stats { packets_received, packets_s
+ 
+ static const char *stats_text[nr_stats] = {
+ 	"PacketsReceived", "PacketsSent", "PacketsBridged", "PacketsInvalid",
+-	"JoinRequests", "JoinFailures", "JoinSuccess",
+-	"LeaveRequests"
++	"JoinRequests", "JoinFailures", "JoinSuccess", "LeaveRequests",
++	"pgmdup", "pgm_odata", "pgm_rdata", "pgm_spm", "pgm_nak"
+ };
+ 
+-int max_wc_cqs = 1000;
+-
+-static int cq_high = 0;	/* Largest batch of CQs encountered */
+-
+ enum channel_type { channel_rdmacm, channel_ud, channel_qp1,
+ 	channel_raw, channel_ibraw,
+ 	channel_packet, channel_incoming,
+@@ -274,7 +270,7 @@ typedef void event_callback(void *);
+ /*
+  * Channel data stucture,
+  *
+- * Channels may be associated with a core on which a busyloop runs.
++ * Channels may be associated with a core on which a usyloop runs.
+  *
+  * Therefore changes to variables may only be made from code
+  * running on that core if multithreading is active.
+@@ -291,6 +287,7 @@ struct rdma_channel {
+ 	struct ibv_flow *flow;
+ 	unsigned int active_receive_buffers;
+ 	unsigned int active_send_buffers;
++	unsigned int cq_high;
+ 	unsigned int nr_cq;
+ 	unsigned int nr_receive;
+ 	unsigned stats[nr_stats];
+@@ -1202,6 +1199,11 @@ struct core_info {
+ 	pthread_t thread;			/* Thread */
+ 	pthread_attr_t attr;
+ 	struct rdma_channel channel[MAX_CQS_PER_CORE];
++	/* Statistics */
++	unsigned samples;
++	long sum_latency;
++	unsigned max_latency;
++	unsigned min_latency;
+ } core_infos[MAX_CORE];
+ 
+ static void show_core_config(void)
+@@ -1276,11 +1278,14 @@ retry:
+ 		c->nr_receive = ci->nr_receive;
+ 	}
+ 
+-	if (c->nr_cq > i->device_attr.max_cqe) {
++	if (c->nr_cq > 10000) {
+ 		logg(LOG_WARNING, "CQs reduced from %d to %d because of %s limitations.\n", c->nr_cq, i->device_attr.max_cqe, i->text);
+-		c->nr_cq = i->device_attr.max_cqe;
++		c->nr_cq = 10000; // i->device_attr.max_cqe;
+ 	}
+ 
++	if (c->nr_receive > 10000)
++		c->nr_receive = 10000;
++
+ 	if (ci->setup(c)) {
+ 		/* Channel setup ok */
+ 
+@@ -1337,7 +1342,8 @@ static void *busyloop(void *private)
+ 	int cqs;
+ 	int i;
+ 	unsigned cpu;
+-	struct ibv_wc wc[max_wc_cqs];
++
++	struct ibv_wc wc[10];
+ 
+ 	pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, NULL);
+ 	numa_run_on_node(core->numa_node);
+@@ -1357,10 +1363,12 @@ static void *busyloop(void *private)
+ 
+ 	now = timestamp(); 	/* Will be done by run_events in the future */
+ 	do {
++		uint64_t tdiff;
++
+ 		cpu_relax();
+ 		/* Scan CQs */
+ 		for(i = 0; i < core->nr_channels; i++) {
+-			cqs = ibv_poll_cq(core->cq[i], max_wc_cqs, wc);
++			cqs = ibv_poll_cq(core->cq[i], 10, wc);
+ 			if (cqs) {
+ 				c = core->channel + i;
+ 
+@@ -1374,6 +1382,22 @@ static void *busyloop(void *private)
+ 				}
+ 			}
+ 		}
++		tdiff = timestamp() - now;
++
++		if (tdiff > core->max_latency)
++			core->max_latency = tdiff;
++		if (tdiff < core->min_latency || !core->min_latency)
++			core->min_latency = tdiff;
++
++		core->sum_latency += tdiff;
++		if (core->samples > 1000000000) {
++			core->samples = 0;
++			core->sum_latency = tdiff;
++		}
++		core->samples ++;
++		if (tdiff > ONE_MILLISECOND)
++			logg(LOG_ERR, "Busyloop took longer than a millisecond %ld\n", tdiff);
++
+ 		run_events();
+ 
+ 	} while (!terminated);
+@@ -1571,6 +1595,7 @@ static void post_receive(struct rdma_cha
+ 		ret = ibv_post_recv(c->qp, &recv_wr, &recv_failure);
+ 		if (ret) {
+ 			free_buffer(buf);
++			errno = ret;
+ 			logg(LOG_WARNING, "ibv_post_recv failed: %s:%s\n", c->text, errname());
+ 			return;
+                 }
+@@ -2358,12 +2383,12 @@ static void handle_rdma_event(void *priv
+ 	
+ 				if (irate) {
+ 					m->interface[INFINIBAND].packet_time = ONE_SECOND / irate;
+-					m->interface[INFINIBAND].burst = max_iburst;
++					m->interface[INFINIBAND].max_burst = max_iburst;
+ 				}
+ 
+ 				if (rrate) {
+ 					m->interface[ROCE].packet_time = ONE_SECOND / rrate;
+-					m->interface[ROCE].burst = max_rburst;
++					m->interface[ROCE].max_burst = max_rburst;
+ 				}
+ 
+ 			}
+@@ -2666,7 +2691,6 @@ static int send_to(struct rdma_channel *
+ 	sge.lkey = c->mr->lkey;
+ 	sge.addr = (uint64_t)addr;
+ 
+-	get_buf(buf);	/* Refcount to keep the buffer for the write queue */
+ 	c->active_send_buffers++;
+ 	ret = ibv_post_send(c->qp, &wr, &bad_send_wr);
+ 	if (ret) {
+@@ -3660,7 +3684,9 @@ static void delayed_send(void *private)
+ 		 * rate limiting should the next packet be paced below mininum again.
+ 		 */
+ 		c->i->mc_rate_limited--;
++		mi->burst = 0;
+ 		mi->last_sent = timestamp();
++		logg(LOG_NOTICE, "%s: Burst ended\n", c->i->text);
+ 	}
+ 
+ 	ret = send_to(c, buf->cur, buf->end - buf->cur, &mi->ai, buf->imm_valid, buf->imm, buf);
+@@ -3699,7 +3725,6 @@ static void receive_multicast(struct buf
+ 
+ 	dest_addr.s_addr = dgid->sib_addr32[3];
+ 	m = hash_lookup_mc(dest_addr);
+-
+ 	if (log_packets > 1) {
+ 		memcpy(&pgm, buf->cur, sizeof(struct pgm_header));
+ 		logg(LOG_NOTICE, "From %s: MC=%s %s\n", c->text, inet_ntoa(dest_addr), pgm_dump(&pgm));
+@@ -3804,17 +3829,19 @@ delayed_packet:
+ 			buf->w = NULL;
+ 			buf->mi = mi;
+ 			add_event(mi->last_delayed, delayed_send, buf, "Delayed Send");
++//			logg(LOG_NOTICE, "%s: Delayed Packet %s delayed by=%ld pending=%d\n", c->i->text, m->text, mi->last_delayed - timestamp(), mi->pending);
+ 			return;
+ 		}
+ 
+ 	       	/* No pending I/O */
+ 		t = timestamp();
+ 
+-		if (now < mi->last_sent + mi->packet_time) {
++		if (t < mi->last_sent + mi->packet_time) {
+ 
+ 			/* Packet spacing too tight */
+ 			mi->burst++;
+ 			if (mi->burst > mi->max_burst) {
++				logg(LOG_NOTICE, "%s: Burst too long. Rate limiting on %s\n", c->i->text, m->text);
+ 
+ 				/* Burst going on too long. Packet must be delayed */
+ 				c->i->mc_rate_limited++;
+@@ -3829,7 +3856,11 @@ delayed_packet:
+ 		/* Packet will be sent now. Record timestamp */
+ 		mi->last_sent = t;
+ 	}
++	
++	if (!mi->ai.ah)	/* After a join it may take awhile for the ah pointer to propagate */
++		usleep(10);
+ 
++	get_buf(buf);		/* Packet will not be freed on return from this function */
+ 	ret = send_to(ch_out, buf->cur, buf->end - buf->cur, &mi->ai, buf->imm_valid, buf->imm, buf);
+ 
+ 	if (ret)
+@@ -4648,8 +4679,8 @@ static void process_cqes(struct rdma_cha
+ {
+ 	unsigned j;
+ 
+-	if (cqs > cq_high)
+-		cq_high = cqs;
++	if (cqs > c->cq_high)
++		c->cq_high = cqs;
+ 
+ 	for (j = 0; j < cqs; j++) {
+ 		struct ibv_wc *w = wc + j;
+@@ -4724,7 +4755,7 @@ static void handle_comp_event(void *priv
+ 	struct rdma_channel *c;
+ 	struct ibv_cq *cq;
+ 	int cqs;
+-	struct ibv_wc wc[max_wc_cqs];
++	struct ibv_wc wc[10];
+ 
+ 	if (ibv_get_cq_event(events, &cq, (void **)&c)) {
+ 		logg(LOG_ERR, "ibv_get_cq_event failed with %s\n", errname());
+@@ -4743,7 +4774,7 @@ static void handle_comp_event(void *priv
+ 	}
+ 
+ 	/* Retrieve completion events and process incoming data */
+-	cqs = ibv_poll_cq(cq, max_wc_cqs, wc);
++	cqs = ibv_poll_cq(cq, 10, wc);
+ 	if (cqs < 0) {
+ 		logg(LOG_WARNING, "CQ polling failed with: %s on %s\n",
+ 			errname(), c->text);
+@@ -4871,8 +4902,8 @@ static unsigned show_multicast(char *b)
+ 		if (buf->free)
+ 		       free++;
+ 
+-	n+= sprintf(b + n, "Multicast: Active=%u NR=%u Max=%u\nBuffers: Active=%u Total=%u CQ#High=%u\n\n",
+-		active_mc, nr_mc, MAX_MC, nr_buffers-free , nr_buffers, cq_high);
++	n+= sprintf(b + n, "Multicast: Active=%u NR=%u Max=%u\nBuffers: Active=%u Total=%u\n\n",
++		active_mc, nr_mc, MAX_MC, nr_buffers-free , nr_buffers);
+ 
+ 	for(m = mcs; m < mcs + nr_mc; m++)
+ 
+@@ -5213,10 +5244,10 @@ static int64_t time_to_next_event(void)
+  */
+ static uint64_t run_events(void)
+ {
++	now = timestamp();
+ 	while (next_event) {
+ 		struct timed_event *te = next_event;
+-
+-		now = timestamp();
++		uint64_t onow;
+ 
+ 		if (te->time > now + ONE_MICROSECOND)
+ 			return te->time - now;
+@@ -5224,6 +5255,11 @@ static uint64_t run_events(void)
+ 		/* Time is up for an event */
+ 		next_event = te->next;
+ 		te->callback(te->private);
++		onow = now;
++		now = timestamp();
++		if (now - onow > ONE_MILLISECOND)
++			logg(LOG_ERR, "Callback %s took %ld nanoseconds which is longer than a millisecond\n", te->text, now-onow);
++
+ 		free(te);
+ 	}
+ 	return 0;
+@@ -5570,7 +5606,6 @@ struct enable_option {
+ { "drop",		NULL,	&drop_packets,	"100", "0",	"Drop multicast packets. The value is the number of multicast packets to send before dropping" },
+ { "flow",		&flow_steering, NULL,	"on", "off",	"Enable flow steering to limit the traffic on the RAW sockets [Experimental, Broken]" },
+ { "huge",		&huge,	NULL,		"on", "off",	"Enable the use of Huge memory for the packet pool" }, 
+-{ "packetspp",		NULL,	&max_wc_cqs,	"1000", "10",	"Packets per Poll: The number of packets to receive per Poll of the RDMA stack" },
+ { "loopbackprev",	&loopback_blocking, NULL, "on", "off",	"Multicast loopback prevention of the NIC" },
+ { "packetsocket",	&packet_socket, NULL,	"on", "off",	"Use a packet socket instead of a RAW QP to capure IB/ROCE traffic" },
+ { "pgm",		NULL,	(int *)&pgm_mode, "on", "off",	"PGM processing mode (0=None, 1= Passtrough, 2=DLR, 3=Resend with new TSI" },
+@@ -5753,7 +5788,6 @@ static void exec_opt(int op, char *optar
+ 			break;
+ 
+ 		case 'e' : enable(optarg, true);
+-			exit(1);
+ 			break;
+ 
+ 		case 'i':
+@@ -5865,8 +5899,8 @@ static const char *inet6_ntoa(void *x)
+ 
+ static const char * gid_text[] = { "GID_TYPE_IB", "GID_TYPE_ROCE_V1", "GID_TYPE_ROCE_V2" };
+ static const char *port_state_text[] = { "PORT_NOP","PORT_DOWN","PORT_INIT","PORT_ARMED","PORT_ACTIVE","PORT_ACTIVE_DEFER" };
+-static const char *mtu_text[] = { "256", "512", "1024", "2048", "4096" };
+-static const char *link_layer_text[] = { "UNSPECIFIED","INFINIBAND","ETHERNET" };
++static const char *mtu_text[] = { "NONE", "256", "512", "1024", "2048", "4096" };
++static const char *link_layer_text[] = { "UNSPECIFIED", "INFINIBAND", "ETHERNET" };
+ 
+ static void interfaces_cmd(char *parameters)
+ {
+@@ -5960,8 +5994,8 @@ static void interfaces_cmd(char *paramet
+ 					i->port_attr.init_type_reply,
+ 					i->port_attr.active_width,
+ 					i->port_attr.active_speed);
+-				printf(" phys_state=%s link_layer=%s flags=%x port_cap_flags2=%x\n",
+-					port_state_text[i->port_attr.phys_state],
++				printf(" phys_state=%d link_layer=%s flags=%x port_cap_flags2=%x\n",
++					i->port_attr.phys_state,
+ 					link_layer_text[i->port_attr.link_layer],
+ 					i->port_attr.flags,
+ 					i->port_attr.port_cap_flags2);
+@@ -5987,14 +6021,42 @@ static void endpoints_cmd(char *paramete
+ 	puts(b);
+ }
+ 
++static void buffers_cmd(char *parameters)
++{
++	struct buf *buf;
++	int free = 0;
++
++	for(buf = buffers; buf < buffers + nr_buffers; buf++)
++		if (buf->free)
++		       free++;
++
++	printf("Buffers: Active=%u Total=%u\n", nr_buffers-free , nr_buffers);
++	/* Sometime show more details */
++}
++
++
+ static void multicast_cmd(char *parameters)
+ {
+-	int n;
+-	char b[5000];
++	struct mc *m;
+ 
+-	n = show_multicast(b);
+-	b[n] = 0;
+-	puts(b);
++	printf("Multicast: Active=%u NR=%u Max=%u\n", active_mc, nr_mc, MAX_MC);
++
++	for(m = mcs; m < mcs + nr_mc; m++) {
++
++		for(enum interfaces in = INFINIBAND; in <= ROCE; in++) {
++			printf("%s %s %s %s %s packet_time=%d max_burst=%d last_sent=%lu last_delayed=%lu pending=%u burst=%d\n",
++				interfaces_text[in], inet_ntoa(m->addr),
++			mc_text[m->interface[in].status],
++			m->interface[in].sendonly ? "Sendonly " : "",
++			in == INFINIBAND ? m->mgid_mode->id : "",
++			m->interface[in].packet_time,
++			m->interface[in].max_burst,
++			m->interface[in].last_sent,
++			m->interface[in].last_delayed,
++			m->interface[INFINIBAND].pending,
++			m->interface[in].burst);
++		}
++	}
+ }
+ 
+ static void statuscmd(char *parameters) {
+@@ -6011,15 +6073,61 @@ static void disablecmd(char *parameters)
+ 
+ static void core_cmd(char *parameters) {
+ 	if (!parameters) {
+-		if (cores)
+-			show_core_config();
+-		else
++		if (cores) {
++			unsigned i;
++
++			for(i = 0; i < cores; i++) {
++				unsigned j;
++				struct core_info *ci = core_infos + i;
++
++				printf("Core %d: NUMA=%d", i, ci->numa_node);
++				printf(" Loops=%u Average=%luns, Max=%uns, Min=%uns\n", ci->samples, ((ci->sum_latency / ci->samples) << 8), ci->max_latency, ci->min_latency);
++
++				for (j = 0; j < ci->nr_channels; j++) {
++					struct rdma_channel *c = ci->channel +j;
++
++					printf(" Channel %s(%s) ActiveRecvBuffers=%u/%u ActiveSendBuffers=%u/%u CQ_high=%d\n", c->text, channel_infos[c->type].suffix,
++						c->active_receive_buffers, c->nr_receive, c->active_send_buffers, c->nr_cq, c->cq_high);
++
++					for(int k = 0; k < nr_stats; k++)
++						if (c->stats[k])
++							printf(" %s=%u", stats_text[k], c->stats[k]);
++
++					printf("\n");
++				}
++			}
++		} else
+ 			printf("No cores active. ib2roce operates in single threaded mode.\n");
+-	} else {
++	} else
+ 		printf("Dynamic reseetting of the core config not supported.\n");
++}
++
++static void tsi_cmd(char *parameters)
++{
++	for(struct i2r_interface *i = i2r; i < i2r + NR_INTERFACES; i++) {
++		printf("%s: TSIs=%d\n", i->text, i->nr_tsi);
++		/* Retrieve TSI streams */
++		struct pgm_stream *t[10];
++		unsigned nr;
++		unsigned offset = 0;
++
++		while ((nr = hash_get_objects(i->pgm_tsi_hash, offset, 10, (void **)t))) {
++			for(int j = 0; j < nr; j++) {
++				struct pgm_stream *ps = t[j];
++				char buf[60];
++
++				format_tsi(buf, &ps->tsi);
++
++				printf("%s: lead=%d trail=%d last=%d lastRepairData=%d oldest=%d\n",
++					buf, ps->lead, ps->trail, ps->last, ps->rlast, ps->oldest);
++
++			}
++			offset += nr;
++		}
+ 	}
+ }
+ 
++
+ static int log_interval;
+ 
+ static void continous(void *private)
+@@ -6054,6 +6162,7 @@ static struct concom {
+ 	const char *description;
+ 	void (*callback)(char *parameters);
+ } concoms[] = {
++{ "buffers",	true,	0,	"Print Information about buffer use",		buffers_cmd },
+ { "continuous",	false,	1,	"Print continous status in specified interval",	continous_cmd },
+ { "cores",	true,	1,	"Setup and list core configuration",		core_cmd },
+ { "disable",	true,	1,	"Disable optional features",			disablecmd },
+@@ -6064,7 +6173,7 @@ static struct concom {
+ { "multicast",	true,	0,	"List Multicast groups and their status",	multicast_cmd },
+ { "quit",	false,	0,	"Terminate ib2roce",				exitcmd },
+ { "status",	true,	0,	"Print a brief status",				statuscmd },
+-{ "stop",	false,	0,	"Terminate ib2roce",				exitcmd },
++{ "tsi",	true,	0,	"Show PGM info",				tsi_cmd },
+ { NULL,		false,	0,	NULL,						NULL }
+ };
+ 

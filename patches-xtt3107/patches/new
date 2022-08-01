@@ -1,0 +1,302 @@
+Index: rdma-core/ib2roce/ib2roce.c
+===================================================================
+--- rdma-core.orig/ib2roce/ib2roce.c
++++ rdma-core/ib2roce/ib2roce.c
+@@ -123,19 +123,20 @@ static int stat_interval = 10;		/* Inter
+ #define ONE_MILLISECOND (ONE_SECOND/1000UL)
+ #define ONE_MICROSECOND (1000UL)
+ 
++/* Conversion of constants to microseconds */
++#define seconds(x) ((x)*ONE_SECOND)
++#define milliseconds(x) ((x)*ONE_MILLISECOND)
++
++
+ /* Timestamp in nanoseconds */
+ static uint64_t timestamp(void)
+ {
+ 	struct timespec t;
+ 
+ 	clock_gettime(CLOCK_REALTIME, &t);
+-	return t.tv_sec * ONE_SECOND + t.tv_nsec;
++	return seconds(t.tv_sec) + t.tv_nsec;
+ }
+ 
+-/* Conversion of constants to microseconds */
+-#define seconds(x) ((x)*ONE_SECOND)
+-#define milliseconds(x) ((x)*ONE_MILLISECOND)
+-
+ #define cpu_relax()	asm volatile("rep; nop")
+ 
+ thread_local uint64_t now;		/* We do not want contention on this one */
+@@ -153,6 +154,13 @@ static void logg(int prio, const char *f
+ 		vprintf(fmt, valist);
+ }
+ 
++static const char *inet6_ntoa(void *x)
++{
++	char buf[INET6_ADDRSTRLEN];
++
++	return inet_ntop(AF_INET6, x, buf, INET6_ADDRSTRLEN);
++}
++
+ static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;		/* Generic serialization mutex */
+ 
+ /* Is the lock taken */
+@@ -294,7 +302,7 @@ struct rdma_channel {
+ 	enum channel_type type;
+ 	bool listening;		/* rdmacm Channel is listening for connections */
+ 	const char *text;
+-	struct rdma_unicast *ru;	/* Onlu rdmacm */
++	struct rdma_unicast *ru;	/* Only rdmacm */
+ 	struct rdma_cm_id *id;		/* Only rdmacm */
+ 	struct sockaddr *bindaddr;	/* Only rdmacm */
+ 	struct ibv_qp_attr attr;	/* Only !rdmacm */
+@@ -598,7 +606,7 @@ static int find_rdma_devices(void)
+ /*
+  * Multicast Handling
+  */
+-#define MAX_MC 500
++#define MAX_MC 200
+ 
+ static unsigned nr_mc;
+ static unsigned active_mc;	/* MC groups actively briding */
+@@ -1140,23 +1148,9 @@ struct channel_info {
+  * in high latency mode which is used for management and for all
+  * activities not pushed to the polling cores.
+  *
+- * Cores | Layout
+- * 0     | Basic thread does everything using poll system call. High latency
+- * 1     | All CQs on one core. qp1, raw channels on the basic thread
+- * 2	 | Separation of comp channels according to the Interface
+- * 4	 | Separation of comp channels according to the Interface and multicast/unicast
+- * 8     | place QP1 and raw channels on separate cores
++ * Cores always contain pairs of QPs on both interfaces. That reduces
++ * lock contention and optimizes the behavior overall.
+  *
+- * Typical 8 core layout
+- * Core  | comp channel
+- * 0 	 | Infiniband Multicast
+- * 1	 | ROCE Multicast		Fallback to Core #0 if cores < 2
+- * 2	 | Infiniband UD channel	Fallback to Core #0 if cores < 4
+- * 3	 | ROCE UD channel		Fallback to Core #1 if cores < 4
+- * 4	 | Infiniband QP1 channel	Fallback to high latency thread if cores < 8
+- * 5	 | ROCE QP1 channel		Fallback to high latency thread if cores < 8
+- * 6     | INfiniband RAW channel	Fallback to high latency thread if cores < 8
+- * 7 	 | ROCE RaW channel		Fallback to high latency thread if cores < 8
+  */
+ 
+ #define MAX_CORE 8
+@@ -2068,7 +2062,6 @@ static void setup_interface(enum interfa
+ {
+ 	struct i2r_interface *i = i2r + in;
+ 	struct ibv_gid_entry *e;
+-	char buf[INET6_ADDRSTRLEN];
+ 
+ 	if (in == INFINIBAND)
+ 		i->maclen = 20;
+@@ -2189,7 +2182,7 @@ static void setup_interface(enum interfa
+ 		i->rdma_name,
+ 		i->if_name, i->ifindex,
+ 		i->port,
+-		inet_ntop(AF_INET6, e->gid.raw, buf, INET6_ADDRSTRLEN),i->gid_index,
++		inet6_ntoa(e->gid.raw), i->gid_index,
+ 		inet_ntoa(i->if_addr.sin_addr), default_port,
+ 		i->multicast ? i->multicast->nr_cq: 0,
+ 		i->ud ? i->ud->nr_cq : 0,
+@@ -2372,7 +2365,6 @@ static void handle_rdma_event(void *priv
+ 				struct rdma_ud_param *param = &event->param.ud;
+ 				struct mc *m = (struct mc *)param->private_data;
+ 				struct ah_info *a = &m->interface[in].ai;
+-				char buf[40];
+ 
+ 				a->remote_qpn = param->qp_num;
+ 				a->remote_qkey = param->qkey;
+@@ -2390,7 +2382,7 @@ static void handle_rdma_event(void *priv
+ 					active_mc++;
+ 
+ 				logg(LOG_NOTICE, "Joined %s MLID 0x%x sl %u on %s\n",
+-					inet_ntop(AF_INET6, param->ah_attr.grh.dgid.raw, buf, 40),
++					inet6_ntoa(param->ah_attr.grh.dgid.raw),
+ 					param->ah_attr.dlid,
+ 					param->ah_attr.sl,
+ 					i->text);
+@@ -3719,7 +3711,6 @@ static void receive_multicast(struct buf
+ 	struct mc *m;
+ 	struct rdma_channel *c = buf->c;
+ 	enum interfaces in = c->i - i2r;
+-	char xbuf[INET6_ADDRSTRLEN];
+ 	struct ib_addr *dgid = (struct ib_addr *)&buf->grh.dgid.raw;
+ 	struct in_addr dest_addr;
+ 	int ret;
+@@ -3772,7 +3763,7 @@ static void receive_multicast(struct buf
+ 		if (mgid[0] != 0xff) {
+ 			if (log_packets) {
+ 				logg(LOG_WARNING, "Discard Packet: Not multicast. MGID=%s/%s\n",
+-					inet_ntop(AF_INET6, mgid, xbuf, INET6_ADDRSTRLEN), c->text);
++					inet6_ntoa(mgid), c->text);
+ 				dump_buf_grh(buf);
+ 			}
+ 			goto invalid_packet;
+@@ -3782,7 +3773,7 @@ static void receive_multicast(struct buf
+ 
+ 			if (log_packets > 3)
+ 				logg(LOG_WARNING, "Discard Packet: Loopback from this host. MGID=%s/%s\n",
+-					inet_ntop(AF_INET6, mgid, xbuf, INET6_ADDRSTRLEN), c->text);
++					inet6_ntoa(mgid), c->text);
+ 
+ 			goto invalid_packet;
+ 		}
+@@ -3794,8 +3785,7 @@ static void receive_multicast(struct buf
+ 			} else {
+ 				if (log_packets) {
+ 					logg(LOG_WARNING, "Discard Packet: MGID multicast signature(%x)  mismatch. MGID=%s\n",
+-							signature,
+-							inet_ntop(AF_INET6, mgid, xbuf, INET6_ADDRSTRLEN));
++							signature, inet6_ntoa(mgid));
+ 					dump_buf_grh(buf);
+ 				}
+ 				goto invalid_packet;
+@@ -4364,7 +4354,6 @@ static void receive_raw(struct buf *buf)
+ 		}
+ 
+ 		if (ib_get_lnh(ih) == 3) {
+-			char *xbuf = alloca(40);
+ 			char *xbuf2 = alloca(40);
+ 
+ 			PULL(buf, buf->grh);
+@@ -4372,7 +4361,7 @@ static void receive_raw(struct buf *buf)
+ 
+ 			snprintf(header + strlen(header), 100-strlen(header), " SGID=%s DGID=%s",
+ 				inet_ntop(AF_INET6, &buf->grh.sgid, xbuf2, INET6_ADDRSTRLEN),
+-				inet_ntop(AF_INET6, &buf->grh.dgid, xbuf, INET6_ADDRSTRLEN));
++				inet6_ntoa(&buf->grh.dgid));
+ 
+ 			if (buf->source_ep->gid.global.interface_id == 0) /* No GID yet ? */
+ 				memcpy(&buf->source_ep->gid, &buf->grh.sgid, sizeof(union ibv_gid));
+@@ -4948,7 +4937,6 @@ static unsigned show_endpoints(char *b)
+ 	for(i = i2r; i < i2r + NR_INTERFACES; i++)
+ 		if (i->context && i->ep) {
+ 		struct endpoint *e[20];
+-		char xbuf[30];
+ 		unsigned nr;
+ 		unsigned offset = 0;
+ 
+@@ -4967,7 +4955,7 @@ static unsigned show_endpoints(char *b)
+ 
+ 				if (ep->gid.global.interface_id)
+ 					n += snprintf(b + n, sizeof(buf) - n, " GID=%s",
+-						inet_ntop(AF_INET6, &ep->gid, xbuf, INET6_ADDRSTRLEN));
++						inet6_ntoa(&ep->gid));
+ 
+ 				for (f = ep->forwards; f; f = f->next) {
+ 					n += snprintf(b + n, sizeof(buf) - n, " Q%d->%sQ%d",
+@@ -5320,8 +5308,8 @@ static void calculate_pps_channel(struct
+ 	if (c->last_snapshot) {
+ 		uint64_t tdiff = now - c->last_snapshot;
+ 
+-		c->pps_in =((c->stats[packets_received] - c->last_received) * ONE_SECOND) / tdiff;
+-		c->pps_out = ((c->stats[packets_sent] - c->last_sent) * ONE_SECOND) / tdiff;
++		c->pps_in = seconds(c->stats[packets_received] - c->last_received) / tdiff;
++		c->pps_out = seconds(c->stats[packets_sent] - c->last_sent) / tdiff;
+ 
+ 		if (c->pps_in > c->max_pps_in)
+ 			c->max_pps_in = c->pps_in;
+@@ -5653,30 +5641,31 @@ static void pid_close(void)
+ /* Table of options that can be set via -e option[=value] */
+ struct enable_option {
+ 	const char *id;
++	bool runtime;		/* Is it changeable at runtime? */
+ 	bool *bool_flag;
+ 	int *int_flag;
+ 	const char *on_value;
+ 	const char *off_value;
+ 	const char *description;
+ } enable_table[] = {
+-{ "buffers",		NULL, &nr_buffers,	"1000000", "10000",	"Number of 8k buffers allocated for packet processing" },
+-{ "bridging",		&bridging, NULL,	"on", "off",	"Forwarding of packets between interfaces" },
+-{ "drop",		NULL,	&drop_packets,	"100", "0",	"Drop multicast packets. The value is the number of multicast packets to send before dropping" },
+-{ "flow",		&flow_steering, NULL,	"on", "off",	"Enable flow steering to limit the traffic on the RAW sockets [Experimental, Broken]" },
+-{ "huge",		&huge,	NULL,		"on", "off",	"Enable the use of Huge memory for the packet pool" }, 
+-{ "loopbackprev",	&loopback_blocking, NULL, "on", "off",	"Multicast loopback prevention of the NIC" },
+-{ "packetsocket",	&packet_socket, NULL,	"on", "off",	"Use a packet socket instead of a RAW QP to capure IB/ROCE traffic" },
+-{ "pgm",		NULL,	(int *)&pgm_mode, "on", "off",	"PGM processing mode (0=None, 1= Passtrough, 2=DLR, 3=Resend with new TSI" },
+-{ "hwrate",		NULL,	&rate,		"2", "0",	"Set the speed in the RDMA NIC to limit the output speed 2 =2.5GBPS 5 = 5GBPS 3 = 10GBPS ...(see enum ibv_rate)" },
+-{ "irate",		NULL, &irate,		"1000", "0",	"Infiniband: Limit the packets per second to be sent to an endpoint (0=off)" },
+-{ "rrate",		NULL, &rrate,		"1000", "0",	"ROCE: Limit the packets per second to be sent to an endpoint (0=off)" },
+-{ "latency",		&latency, NULL,		"on", "off",	"Monitor latency of busyloop and event processing and provide stats" },
+-{ "iburst",		NULL, &max_iburst,	"100", "0",	"Infiniband: Exempt the first N packets from swrate (0=off)" },
+-{ "rburst",		NULL, &max_rburst,	"100", "0",	"ROCE: Exempt the first N packets from swrate (0=off)" },
+-{ "raw",		&raw,	NULL,		"on", "off",	"Use of RAW sockets to capture SIDR Requests. Avoids having to use a patched kernel" },
+-{ "statint",		NULL, &stat_interval,	"60", "1",	"Sampling interval to calculate pps values" },
+-{ "unicast",		&unicast, NULL,		"on", "off",	"Processing of unicast packets with QP1 handling of SIDR REQ/REP" },
+-{ NULL, NULL, NULL, NULL, NULL, NULL }
++{ "buffers", false,		NULL, &nr_buffers,	"1000000", "10000",	"Number of 8k buffers allocated for packet processing" },
++{ "bridging", false,		&bridging, NULL,	"on", "off",	"Forwarding of packets between interfaces" },
++{ "drop", true,	NULL,		&drop_packets,		"100", "0",	"Drop multicast packets. The value is the number of multicast packets to send before dropping" },
++{ "flow", false,		&flow_steering, NULL,	"on", "off",	"Enable flow steering to limit the traffic on the RAW sockets [Experimental, Broken]" },
++{ "huge", false,		&huge, NULL,		"on", "off",	"Enable the use of Huge memory for the packet pool" }, 
++{ "loopbackprev", false,	&loopback_blocking, NULL, "on", "off",	"Multicast loopback prevention of the NIC" },
++{ "packetsocket", false,	&packet_socket, NULL,	"on", "off",	"Use a packet socket instead of a RAW QP to capure IB/ROCE traffic" },
++{ "pgm", true,			NULL, (int *)&pgm_mode, "on", "off",	"PGM processing mode (0=None, 1= Passtrough, 2=DLR, 3=Resend with new TSI" },
++{ "hwrate", true,		NULL, &rate,		"2", "0",	"Set the speed in the RDMA NIC to limit the output speed 2 =2.5GBPS 5 = 5GBPS 3 = 10GBPS ...(see enum ibv_rate)" },
++{ "irate", true,		NULL, &irate,		"1000", "0",	"Infiniband: Limit the packets per second to be sent to an endpoint (0=off)" },
++{ "rrate", true,		NULL, &rrate,		"1000", "0",	"ROCE: Limit the packets per second to be sent to an endpoint (0=off)" },
++{ "latency", true,		&latency, NULL,		"on", "off",	"Monitor latency of busyloop and event processing and provide stats" },
++{ "iburst", true,		NULL, &max_iburst,	"100", "0",	"Infiniband: Exempt the first N packets from swrate (0=off)" },
++{ "rburst", true,		NULL, &max_rburst,	"100", "0",	"ROCE: Exempt the first N packets from swrate (0=off)" },
++{ "raw", false,			&raw, NULL,		"on", "off",	"Use of RAW sockets to capture SIDR Requests. Avoids having to use a patched kernel" },
++{ "statint", true,		NULL, &stat_interval,	"60", "1",	"Sampling interval to calculate pps values" },
++{ "unicast", false,		&unicast, NULL,		"on", "off",	"Processing of unicast packets with QP1 handling of SIDR REQ/REP" },
++{ NULL, false, NULL, NULL, NULL, NULL, NULL }
+ };
+ 
+ static void enable(char *option, bool enable)
+@@ -5722,11 +5711,15 @@ static void enable(char *option, bool en
+ 		if (strcasecmp(name, enable_table[i].id) == 0)
+ 			goto got_it;
+ 	}
+-	fprintf(stderr, "Unknown option %s\n", name);
++	printf("Unknown option %s\n", name);
+ 	return;
+ 
+ got_it:
+ 	eo = enable_table + i;
++	if (!eo->runtime && (i2r[ROCE].context || i2r[INFINIBAND].context)) {
++		printf("Cannot change option \"%s\" at runtime\n", option);
++		return;
++	}
+ 	if (!value) {
+ 		if (enable) 
+ 			value = eo->on_value;
+@@ -5920,7 +5913,7 @@ static void exec_opt(int op, char *optar
+ 			break;
+ 
+ 		default:
+-			printf("ib2roce " VERSION " Mar 23,2022 Christoph Lameter <cl@linux.com>\n");
++			printf("ib2roce " VERSION " Apr 5,2022 Christoph Lameter <cl@linux.com>\n");
+ 			printf("Usage: ib2roce [<option>] ...\n");
+ 			printf("-b|--beacon <multicast address>		Send beacon every second. Off by default\n");
+ 			printf("-c|--config <file>			Read config from file\n");
+@@ -5950,13 +5943,6 @@ static void exitcmd(char *parameters)
+ 	terminate(0);
+ }
+ 
+-static const char *inet6_ntoa(void *x)
+-{
+-	char buf[INET6_ADDRSTRLEN];
+-
+-	return inet_ntop(AF_INET6, x, buf, INET6_ADDRSTRLEN);
+-}
+-
+ static const char * gid_text[] = { "GID_TYPE_IB", "GID_TYPE_ROCE_V1", "GID_TYPE_ROCE_V2" };
+ static const char *port_state_text[] = { "PORT_NOP","PORT_DOWN","PORT_INIT","PORT_ARMED","PORT_ACTIVE","PORT_ACTIVE_DEFER" };
+ static const char *mtu_text[] = { "NONE", "256", "512", "1024", "2048", "4096" };
+@@ -6256,7 +6242,7 @@ static void continous(void *private)
+ 	brief_status();
+ 
+ 	if (log_interval)
+-		add_event(timestamp() + log_interval * ONE_SECOND,
++		add_event(timestamp() + seconds(log_interval),
+ 				continous, NULL, "Continous Logging");
+ }
+ 

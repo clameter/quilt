@@ -1,0 +1,236 @@
+Index: rdma-core/ib2roce/ib2roce.c
+===================================================================
+--- rdma-core.orig/ib2roce/ib2roce.c
++++ rdma-core/ib2roce/ib2roce.c
+@@ -139,6 +139,90 @@ static uint64_t timestamp(void)
+ 
+ #define cpu_relax()	asm volatile("rep; nop")
+ 
++struct ring {
++	char *start;	/* Updated by ring_get() */
++	char *end;	/* Updated by ring_put() */
++	unsigned ring_size;
++	buf[];
++}
++
++static bool ring_put(struct ring *r, char *msg, unsigned len)
++{
++	char *start = r->start;
++	char *end = r->end;
++
++	if (len >250)
++		return false;
++
++	if (end == r->buf + r->ring_size)
++		end = r->buf;
++
++	*end = len;
++
++	if (end + len + 1 < r->buf + r->ring_size) {
++		/* Copy into buffer unsegmented */
++		*end = len;
++		memcpy(end + 1, msg, len);
++		end += len + 1;
++		return true;
++
++	} else { /* Wraps around the end */
++		unsigned left = r->buf + r->ring_size - end;
++
++		if (left)
++			memcpy(msg, end + 1, left);
++
++		memcpy(msg + left + 1, r->buf, len - left);
++
++		end = len - left;
++		return true;
++	}	
++	
++}
++
++static int ring_get(struct ring *r, char *msg, unsigned max_len)
++{
++	char *start = r->start;
++	char *end = r->end;
++	uint8_t len;
++
++	if (start == end)
++		return 0;
++
++	len = *start;
++
++	if (start + len < end) { /* Fits right into the buffer */
++		memcpy(msg, start + 1, len);
++		start += len + 1;
++
++	} else { /* Wraps around the end */
++		unsigned left;
++
++		left = r->ring_size - start;
++		if (left)
++			memcpy(msg, start + 1, left);
++		if (len - left)
++			memcpy(msg, r->start, len - left);
++
++		start = r->buf + len - left;
++	}
++
++	msg[len] = 0;
++	r->start = start;
++	return len;
++}
++
++static void ring_init(struct ring *r, char *buffer, unsigned ring_size)
++{
++	r->start = buf
++	r->end = buf;
++}
++
++static bool ring_empty(struct ring *r)
++{
++	return r->start == r->end;
++}
++
+ thread_local uint64_t now;		/* We do not want contention on this one */
+ 
+ __attribute__ ((format (printf, 2, 3)))
+@@ -148,6 +232,14 @@ static void logg(int prio, const char *f
+ 
+ 	va_start(valist, fmt);
+ 
++	if (current) {
++		int n;
++		char b[150];
++		b[0] = '0' + prio;
++
++		n = vsnprintf(b + 1, 149, fmt, valist);
++		ring_put(current->ring, b, n);
++	}
+ 	if (background)
+ 		vsyslog(prio, fmt, valist);
+ 	else
+@@ -1202,8 +1294,14 @@ struct core_info {
+ 	long sum_latency;
+ 	unsigned max_latency;
+ 	unsigned min_latency;
++	char *start;	/* Start and end of contents of logbuffer */
++	char *end;
++	logbuffer char[LOGBUFSIZE];
++
+ } core_infos[MAX_CORE];
+ 
++thread_local struct core_info *current = NULL;
++
+ static void show_core_config(void)
+ {
+ 	unsigned i;
+@@ -1342,17 +1440,17 @@ static void arm_channels(struct core_inf
+ static void *busyloop(void *private)
+ {
+ 	struct rdma_channel *c;
+-	struct core_info *core = private;
+ 	int cqs;
+ 	int i;
+ 	unsigned cpu;
+ 
+ 	struct ibv_wc wc[10];
+ 
++	current = private;
+ 	pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, NULL);
+-	numa_run_on_node(core->numa_node);
++	numa_run_on_node(current->numa_node);
+ 
+-	core->state = core_init;
++	current->state = core_init;
+ 
+ 	cpu = sched_getcpu();
+ 	logg(LOG_NOTICE, "Busyloop started (core %ld) on CPU %d NUMA=%d\n", core - core_infos, cpu, core->numa_node);
+@@ -1361,9 +1459,9 @@ static void *busyloop(void *private)
+ 	 * Initialize relevant data structures for this thread. These must be allocated
+ 	 * from the thread to ensure that they are thread local
+ 	 */
+-	arm_channels(core);
++	arm_channels(current);
+ 
+-	core->state = core_running;
++	current->state = core_running;
+ 
+ 	now = timestamp(); 	/* Will be done by run_events in the future */
+ 	do {
+@@ -1371,17 +1469,17 @@ static void *busyloop(void *private)
+ 	
+ 		cpu_relax();
+ 		/* Scan CQs */
+-		for(i = 0; i < core->nr_channels; i++) {
+-			cqs = ibv_poll_cq(core->cq[i], 10, wc);
++		for(i = 0; i < current->nr_channels; i++) {
++			cqs = ibv_poll_cq(current->cq[i], 10, wc);
+ 			if (cqs) {
+-				c = core->channel + i;
++				c = current->channel + i;
+ 
+ 				if (cqs > 0)
+ 					process_cqes(c, wc, cqs);
+ 				else {
+ 					logg(LOG_WARNING, "Busyloop: CQ polling failed with: %s on %s\n",
+ 						errname(), c->text);
+-					core->state = core_err;
++					current->state = core_err;
+ 					continue;
+ 				}
+ 			}
+@@ -1389,17 +1487,17 @@ static void *busyloop(void *private)
+ 		if (latency) {
+ 			tdiff = timestamp() - now;
+ 
+-			if (tdiff > core->max_latency)
++			if (tdiff > current->max_latency)
+ 				core->max_latency = tdiff;
+-			if (tdiff < core->min_latency || !core->min_latency)
++			if (tdiff < current->min_latency || !core->min_latency)
+ 				core->min_latency = tdiff;
+ 
+ 			if (tdiff > 5000) {
+-				core->sum_latency += tdiff;
+-				core->samples++;
+-				if (core->samples > 1000000000) {
+-					core->samples = 1;
+-					core->sum_latency = tdiff;
++				current->sum_latency += tdiff;
++				current->samples++;
++				if (current->samples > 1000000000) {
++					current->samples = 1;
++					current->sum_latency = tdiff;
+ 				}
+ 				if (tdiff > ONE_MILLISECOND)
+ 					logg(LOG_ERR, "Busyloop took longer than a millisecond %ld\n", tdiff);
+@@ -1413,6 +1511,20 @@ static void *busyloop(void *private)
+ 	return NULL;
+ }
+ 
++void log_out(void *private)
++{
++	struct core_info *c = private;
++
++	if (ring_used(c->ring)) {
++		char msg[150];
++
++		ring_get(c->ring, msg, 150);
++		prio = msg[0] - '0';
++		logg(prio, "%s", msg + 1);
++	}
++	add_event(now + milliseconds(100), log_out, ci, "Check Logbuffer");
++}
++
+ /* Called after all the channels have been setup */
+ static void start_cores(void)
+ {
+@@ -1426,6 +1538,9 @@ static void start_cores(void)
+ 		if (!ci->nr_channels)
+ 			continue;
+ 
++		ring_init(ci->ring);
++		log_out(ci);
++
+ 		if (pthread_create(&ci->thread, &ci->attr, &busyloop, core_infos + j)) {
+ 			logg(LOG_CRIT, "Pthread create failed: %s\n", errname());
+ 			abort();

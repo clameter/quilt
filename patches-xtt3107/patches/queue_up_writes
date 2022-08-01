@@ -1,0 +1,53 @@
+Index: rdma-core/ib2roce/ib2roce.c
+===================================================================
+--- rdma-core.orig/ib2roce/ib2roce.c
++++ rdma-core/ib2roce/ib2roce.c
+@@ -217,7 +217,7 @@ enum channel_type { channel_rdmacm, chan
+ 
+ struct buf;
+ 
+-typedef void receive_callback(struct buf *);
++typedef bool receive_callback(struct buf *, struct ibv_send_wr *wr);
+ 
+ struct rdma_channel {
+ 	struct i2r_interface *i;	/* The network interface of this channel */
+@@ -2380,7 +2380,7 @@ static int send_ud(struct rdma_channel *
+ static int send_to(struct rdma_channel *c,
+ 	void *addr, unsigned len, struct ah_info *ai,
+ 	bool imm_used, unsigned imm,
+-	struct buf *buf)
++	struct buf *buf, struct ibv_send_wr *wr)
+ {
+ 	struct ibv_send_wr wr, *bad_send_wr;
+ 	struct ibv_sge sge;
+@@ -2932,7 +2932,7 @@ static void learn_source_address(struct
+  * We have an GRH header so the packet has been processed by the RDMA
+  * Subsystem and we can take care of it using the RDMA calls
+  */
+-static void receive_multicast(struct buf *buf)
++static bool receive_multicast(struct buf *buf, struct ibv_send_wr *wr)
+ {
+ 	struct mc *m;
+ 	struct rdma_channel *c = buf->c;
+@@ -3037,18 +3037,19 @@ static void receive_multicast(struct buf
+ 	if (!bridging)
+ 		goto free_out;
+ 
+-	ret = send_to(i2r[in ^ 1].multicast, buf->cur, buf->end - buf->cur, m->ai + (in ^ 1), false, 0, buf);
++	ret = send_to(i2r[in ^ 1].multicast, buf->cur, buf->end - buf->cur, m->ai + (in ^ 1), false, 0, buf, Wr);
+ 
+ 	if (ret)
+ 		goto free_out;
+ 
+ 	st(c, packets_bridged);
+-	return;
++	return true;
+ 
+ invalid_packet:
+ 	st(c, packets_invalid);
+ free_out:
+ 	free_buffer(buf);
++	return false;
+ }
+ 
+ /*

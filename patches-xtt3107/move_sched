@@ -2,16 +2,24 @@ Index: rdma-core/ib2roce/ib2roce.c
 ===================================================================
 --- rdma-core.orig/ib2roce/ib2roce.c
 +++ rdma-core/ib2roce/ib2roce.c
-@@ -78,6 +78,8 @@
- #include "ib_hdrs.h"
+@@ -49,7 +49,6 @@
+ #include <fcntl.h>
+ #include <ctype.h>
+ #include <pthread.h>
+-#include <threads.h>
+ #include <numa.h>
+ #include <stdatomic.h>
+ #include <arpa/inet.h>
+@@ -80,6 +79,8 @@
  #include "fifo.h"
+ #include "ring.h"
  #include "hash.h"
 +#include "sched.h"
 +
  #include "ibraw.h"
  #include "cma-hdr.h"
  
-@@ -99,7 +101,6 @@ static unsigned default_port = 0;	/* Por
+@@ -102,7 +103,6 @@ static unsigned default_port = 0;	/* Por
  static unsigned default_mc_port = 4711;	/* Port for MC groups that do not have a port (if a port is required) */
  static bool debug = false;		/* Stay in foreground, print more details */
  static bool background = false;		/* Are we actually running in the background ? */
@@ -19,14 +27,18 @@ Index: rdma-core/ib2roce/ib2roce.c
  static bool update_requested = false;	/* Received SIGUSR1. Dump all MC data details */
  static bool beacon = false;		/* Announce our presence (and possibly coordinate between multiple instances in the future */
  static bool bridging = true;		/* Allow briding */
-@@ -118,28 +119,6 @@ static int max_rburst = 10;		/* Dont del
- static int max_iburst = 10;		/* Dont delay until # of packets for Infiniband */
+@@ -125,28 +125,6 @@ static int max_iburst = 10;		/* Dont del
+ static int stat_interval = 10;		/* Interval for statistics */
+ static int loglevel = LOG_INFO;		/* LOG level for console output */
  
- 
--
 -#define ONE_SECOND (1000000000UL)
 -#define ONE_MILLISECOND (ONE_SECOND/1000UL)
 -#define ONE_MICROSECOND (1000UL)
+-
+-/* Conversion of constants to microseconds */
+-#define seconds(x) ((x)*ONE_SECOND)
+-#define milliseconds(x) ((x)*ONE_MILLISECOND)
+-
 -
 -/* Timestamp in nanoseconds */
 -static uint64_t timestamp(void)
@@ -34,32 +46,27 @@ Index: rdma-core/ib2roce/ib2roce.c
 -	struct timespec t;
 -
 -	clock_gettime(CLOCK_REALTIME, &t);
--	return t.tv_sec * ONE_SECOND + t.tv_nsec;
+-	return seconds(t.tv_sec) + t.tv_nsec;
 -}
--
--/* Conversion of constants to microseconds */
--#define seconds(x) ((x)*ONE_SECOND)
--#define milliseconds(x) ((x)*ONE_MILLISECOND)
 -
 -#define cpu_relax()	asm volatile("rep; nop")
 -
--uint64_t now;
+-thread_local uint64_t now;		/* We do not want contention on this one */
 -
  __attribute__ ((format (printf, 2, 3)))
- static void logg(int prio, const char *fmt, ...)
- {
-@@ -415,10 +394,7 @@ static inline void st(struct rdma_channe
+ static void logg(int prio, const char *fmt, ...);
+ 
+@@ -434,9 +412,6 @@ static inline void st(struct rdma_channe
  }
  
  /* Forwards */
 -static void add_event(uint64_t  when, event_callback *callback, void *private, const char *text);
 -static uint64_t run_events(void);
- static struct rdma_unicast *new_rdma_unicast(struct i2r_interface *i, struct sockaddr_in *sin);
 -static void register_callback(void (*callback)(void *), int fd, void *private);
- static void handle_receive_packet(void *private);
  static void handle_comp_event(void *private);
  static void handle_rdma_event(void *private);
-@@ -1332,15 +1308,36 @@ static void arm_channels(struct core_inf
+ static void handle_async_event(void *private);
+@@ -1410,18 +1385,39 @@ static void arm_channels(struct core_inf
   *
   * NOHZ should be enabled though to avoid hiccups from timer interrupts
   */
@@ -67,16 +74,18 @@ Index: rdma-core/ib2roce/ib2roce.c
 +static void scan_cqs(void *private)
  {
 -	struct rdma_channel *c;
- 	struct core_info *core = private;
 -	int cqs;
++	struct core_info *core = private;
  	int i;
 -	unsigned cpu;
+-
 +	int cqs;
 +	struct rdma_channel *c;
- 	struct ibv_wc wc[max_wc_cqs];
+ 	struct ibv_wc wc[10];
  
+-	current = private;
 +	for(i = 0; i < core->nr_channels; i++) {
-+		cqs = ibv_poll_cq(core->cq[i], max_wc_cqs, wc);
++		cqs = ibv_poll_cq(core->channel[i].cq, 10, wc);
 +		if (cqs) {
 +			c = core->channel + i;
 +
@@ -84,7 +93,7 @@ Index: rdma-core/ib2roce/ib2roce.c
 +				process_cqes(c, wc, cqs);
 +			else {
 +				logg(LOG_WARNING, "Busyloop: CQ polling failed with: %s on %s\n",
-+					errname(), c->text);
++						errname(), c->text);
 +				core->state = core_err;
 +				continue;
 +			}
@@ -92,49 +101,80 @@ Index: rdma-core/ib2roce/ib2roce.c
 +	}
 +}
 +
++
 +static void *busyloop(void *private)
 +{
 +	struct core_info *core = private;
 +	unsigned cpu;
 +
  	pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, NULL);
- 	numa_run_on_node(core->numa_node);
+-	numa_run_on_node(current->numa_node);
++	numa_run_on_node(core->numa_node);
  
-@@ -1354,32 +1351,8 @@ static void *busyloop(void *private)
+ 	current->state = core_init;
+ 
+@@ -1432,57 +1428,10 @@ static void *busyloop(void *private)
+ 	 * Initialize relevant data structures for this thread. These must be allocated
  	 * from the thread to ensure that they are thread local
  	 */
- 	arm_channels(core);
+-	arm_channels(current);
 -
- 	core->state = core_running;
+-	current->state = core_running;
 -
 -	now = timestamp(); 	/* Will be done by run_events in the future */
 -	do {
+-		uint64_t tdiff;
+-	
 -		cpu_relax();
 -		/* Scan CQs */
--		for(i = 0; i < core->nr_channels; i++) {
--			cqs = ibv_poll_cq(core->cq[i], max_wc_cqs, wc);
+-		for(i = 0; i < current->nr_channels; i++) {
+-			c = current->channel + i;
+-			cqs = ibv_poll_cq(c->cq, 10, wc);
 -			if (cqs) {
--				c = core->channel + i;
 -
 -				if (cqs > 0)
 -					process_cqes(c, wc, cqs);
 -				else {
--					logg(LOG_WARNING, "Busyloop: CQ polling failed with: %s on %s\n",
+-					logg(LOG_ERR, "Busyloop: CQ polling failed with: %s on %s\n",
 -						errname(), c->text);
--					core->state = core_err;
+-					current->state = core_err;
 -					continue;
 -				}
 -			}
 -		}
+-
+-
+-		if (latency) {
+-			tdiff = timestamp() - now;
+-
+-			if (tdiff > current->max_latency)
+-				current->max_latency = tdiff;
+-			if (tdiff < current->min_latency || !current->min_latency)
+-				current->min_latency = tdiff;
+-
+-			if (tdiff > 5000) {
+-				current->sum_latency += tdiff;
+-				current->samples++;
+-				if (current->samples > 1000000000) {
+-					current->samples = 1;
+-					current->sum_latency = tdiff;
+-				}
+-				if (tdiff > ONE_MILLISECOND)
+-					logg(LOG_NOTICE, "Busyloop took longer than a millisecond %ld\n", tdiff);
+-			}
+-		}
+-
 -		run_events();
 -
 -	} while (!terminated);
--
++	arm_channels(core);
+ 
++	core->state = core_running;
 +	busy_event_loop(scan_cqs, core);
  	return NULL;
  }
  
-@@ -4824,7 +4797,7 @@ static void handle_async_event(void *pri
+@@ -5088,7 +5037,7 @@ static void handle_async_event(void *pri
  	 * We can make exceptions later.
  	 */
  
@@ -143,7 +183,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  
          ibv_ack_async_event(&event);
  }
-@@ -5168,72 +5141,6 @@ static void beacon_setup(const char *opt
+@@ -5441,81 +5390,6 @@ static void beacon_setup(const char *opt
  	add_event(timestamp() + ONE_SECOND, beacon_send, NULL, "Send Beacon");
  }
  
@@ -196,10 +236,10 @@ Index: rdma-core/ib2roce/ib2roce.c
 - */
 -static uint64_t run_events(void)
 -{
+-	now = timestamp();
 -	while (next_event) {
 -		struct timed_event *te = next_event;
--
--		now = timestamp();
+-		uint64_t old_now;
 -
 -		if (te->time > now + ONE_MICROSECOND)
 -			return te->time - now;
@@ -207,6 +247,15 @@ Index: rdma-core/ib2roce/ib2roce.c
 -		/* Time is up for an event */
 -		next_event = te->next;
 -		te->callback(te->private);
+-	
+-		if (latency) {
+-			old_now = now;
+-			now = timestamp();
+-			if (now - old_now > ONE_MILLISECOND)
+-				logg(LOG_ERR, "Callback %s took %ld nanoseconds which is longer than a millisecond\n",
+-					te->text, now-old_now);
+-		}
+-
 -		free(te);
 -	}
 -	return 0;
@@ -216,19 +265,26 @@ Index: rdma-core/ib2roce/ib2roce.c
  static void check_joins(void *private)
  {
  	struct i2r_interface *i;
-@@ -5268,9 +5175,8 @@ static void brief_status(void)
+@@ -5578,15 +5452,14 @@ static void calculate_pps(void *private)
+ 
+ static void brief_status(void)
+ {
+-	char buf[100];
+-	char buf2[150];
++	char buf[4000];
++	char buf2[4200];
+ 	char counts[200];
+ 
  	unsigned n = 0;
  	const char *events;
  
 -	for(struct timed_event *z = next_event; z; z = z->next)
 -		n += sprintf(buf + n, "%ldms,", (z->time - timestamp()) / ONE_MILLISECOND);
--
-+	n = get_timer_list(buf);
-+	
++	n = get_timer_list(buf, ',');
+ 
  	if (n > 0)
  		buf[n -1] = 0;
- 	else
-@@ -5325,30 +5231,6 @@ static void logging(void *private)
+@@ -5642,30 +5515,6 @@ static void logging(void *private)
  	add_event(timestamp() + seconds(10), logging, NULL, "Brief Status");
  }
  
@@ -248,7 +304,7 @@ Index: rdma-core/ib2roce/ib2roce.c
 -	struct pollfd e = { fd, POLLIN, 0};
 -
 -	if (poll_items == MAX_POLL_ITEMS)
--		abort();
+-		panic("Max poll items reached\n");
 -
 -	poll_callback[poll_items] = callback;
 -	pfd[poll_items] = e;
@@ -258,8 +314,8 @@ Index: rdma-core/ib2roce/ib2roce.c
 -
  static void setup_timed_events(void)
  {
- 	uint64_t t;
-@@ -5397,67 +5279,6 @@ static void arm_channels(struct core_inf
+ 	now = timestamp();
+@@ -5715,67 +5564,6 @@ static void arm_channels(struct core_inf
  }
  
  
@@ -327,7 +383,28 @@ Index: rdma-core/ib2roce/ib2roce.c
  static void update_status(int x)
  {
  	update_requested = true;
-@@ -6104,7 +5925,7 @@ static void console_input(void *private)
+@@ -6495,12 +6283,17 @@ static void tsi_cmd(char *parameters)
+ 
+ static void event_cmd(char *parameters)
+ {
++	char buffer[4000];
++	int n;
++
+ 	printf("Scheduled events on the high latency thread\n");
+ 	printf("-------------------------------------------\n");
+ 
+-	for(struct timed_event *z = next_event; z; z = z->next) {
+-		printf("%ldms %s\n", (z->time - timestamp()) / ONE_MILLISECOND, z->text);
+-	}
++	n = get_timer_list(buffer, '\n');
++	if (n)
++		printf("%s\n", buffer);
++	else
++		printf("No events.\n");
+ }
+ 
+ static int log_interval;
+@@ -6587,7 +6380,7 @@ static void console_input(void *private)
  
  	if (ret == 0) {
  		printf("\n");
@@ -336,8 +413,8 @@ Index: rdma-core/ib2roce/ib2roce.c
  		return;
  	}
  
-@@ -6220,8 +6041,11 @@ int main(int argc, char **argv)
- 	post_receive_buffers();
+@@ -6707,8 +6500,11 @@ int main(int argc, char **argv)
+ 	send_queue_monitor(NULL);
  
  	start_cores();
 +	arm_channels(NULL);
@@ -477,12 +554,12 @@ Index: rdma-core/ib2roce/sched.c
 +		return 0;
 +}
 +
-+int get_timer_list(char *buf)
++int get_timer_list(char *buf, char separator)
 +{
 +	int n = 0;
 +
 +	for(struct timed_event *z = next_event; z; z = z->next)
-+		n += sprintf(buf + n, "%ldms,", (z->time - timestamp()) / ONE_MILLISECOND);
++		n += sprintf(buf + n, "%ldms%c", (z->time - timestamp()) / ONE_MILLISECOND, separator);
 +
 +	return n;
 +}
@@ -523,7 +600,7 @@ Index: rdma-core/ib2roce/sched.c
 +
 +		if (te->time > now + ONE_MICROSECOND)
 +			return te->time - now;
-+	
++
 +		/* Time is up for an event */
 +		next_event = te->next;
 +		te->callback(te->private);
@@ -542,7 +619,7 @@ Index: rdma-core/ib2roce/sched.c
 +{
 +	int64_t timeout;
 +	int events = 0;
-+ 
++
 +	while (!terminated) {
 +
 +		timeout = time_to_next_event();
@@ -557,10 +634,10 @@ Index: rdma-core/ib2roce/sched.c
 +				timeout = run_events();
 +
 +		}
-+	
++
 +		if (timeout <= 0 || timeout > (long)seconds(10))
 +			timeout = seconds(10);
-+ 
++
 +	 	events = poll(pfd, poll_items, (timeout + ONE_MILLISECOND/2) / ONE_MILLISECOND);
 +
 +		if (events < 0)
@@ -594,7 +671,7 @@ Index: rdma-core/ib2roce/sched.h
 ===================================================================
 --- /dev/null
 +++ rdma-core/ib2roce/sched.h
-@@ -0,0 +1,72 @@
+@@ -0,0 +1,73 @@
 +#ifndef IB2ROCE_SCHED_H
 +#define IB2ROCE_SCHED_H
 +/*
@@ -640,6 +717,7 @@ Index: rdma-core/ib2roce/sched.h
 +#include <stdlib.h>
 +#include <stdint.h>
 +#include <sys/types.h>
++#include <threads.h>
 +
 +/* Time keeping */
 +#define ONE_SECOND (1000000000UL)
@@ -664,6 +742,18 @@ Index: rdma-core/ib2roce/sched.h
 +int busy_event_loop(event_callback *callback, void *private);	/* Enter loop running events and servicing fd callbacks */
 +void terminate(int x);		/* Terminate the event loop */
 +
-+int get_timer_list(char *b);	/* List the timers and put the data into the buffer */
++int get_timer_list(char *b, char separator);	/* List the timers and put the data into the buffer */
 +
 +#endif
+Index: rdma-core/ib2roce/CMakeLists.txt-NO_MSTFLINT
+===================================================================
+--- rdma-core.orig/ib2roce/CMakeLists.txt-NO_MSTFLINT
++++ rdma-core/ib2roce/CMakeLists.txt-NO_MSTFLINT
+@@ -7,6 +7,7 @@ rdma_executable(ib2roce
+   hash.c
+   errno.c
+   ring.c
++  sched.c
+ )
+ target_link_libraries(ib2roce LINK_PRIVATE
+   ibverbs

@@ -1,0 +1,125 @@
+Index: rdma-core/ib2roce/ib2roce.c
+===================================================================
+--- rdma-core.orig/ib2roce/ib2roce.c
++++ rdma-core/ib2roce/ib2roce.c
+@@ -306,7 +306,9 @@ struct rdma_channel {
+ 	enum channel_type type;
+ 	bool listening;		/* rdmacm Channel is listening for connections */
+ 	const char *text;
++#ifdef RU
+ 	struct rdma_unicast *ru;	/* Only rdmacm */
++#endif
+ 	struct rdma_cm_id *id;		/* Only rdmacm */
+ 	struct sockaddr *bindaddr;	/* Only rdmacm */
+ 	struct ibv_qp_attr attr;	/* Only !rdmacm */
+@@ -408,6 +410,7 @@ struct ah_info {
+ 	uint32_t remote_qkey;
+ };
+ 
++#ifdef RU
+ /*
+  * A Unicastconnection to a certain port and host with
+  * a list of pending I/O items and an rdma channel
+@@ -424,6 +427,8 @@ struct rdma_unicast {
+ 	struct ah_info ai;		/* If ai.ah != NULL then the address info is valid */
+ };
+ 
++#endif
++
+ static inline void st(struct rdma_channel *c, enum stats s)
+ {
+ 	c->stats[s]++;
+@@ -959,7 +964,9 @@ static void pull(struct buf *buf, void *
+ 
+ static void beacon_received(struct buf *buf);
+ 
++#ifdef RU
+ static int send_buf(struct buf *buf, struct rdma_unicast *ra);
++#endif
+ 
+ static struct buf *buffers;
+ 
+@@ -2141,7 +2148,9 @@ static void setup_interface(enum interfa
+ 
+ 	numa_run_on_node(i->numa_node);
+ 
++#ifdef RU
+ 	i->ru_hash = hash_create(offsetof(struct rdma_unicast, sin), sizeof(struct sockaddr_in));
++#endif
+ 	i->ip_to_ep = hash_create(offsetof(struct endpoint, addr), sizeof(struct in_addr));
+ 	if (i == i2r + INFINIBAND)
+ 		i->ep = hash_create(offsetof(struct endpoint, lid), sizeof(uint16_t));
+@@ -2302,6 +2311,7 @@ static void join_processing(void)
+ 	}
+ }
+ 
++#ifdef RU
+ static void resolve_start(struct rdma_unicast *);
+ 
+ static void zap_channel(struct rdma_unicast *ru)
+@@ -2376,6 +2386,7 @@ static void resolve(struct rdma_unicast
+ 	if (fifo_put(&i->resolve_queue, ru))
+ 		resolve_start(ru);
+ }
++#endif
+ 
+ static void handle_rdma_event(void *private)
+ {
+@@ -2383,7 +2394,9 @@ static void handle_rdma_event(void *priv
+ 	struct rdma_cm_event *event;
+ 	int ret;
+ 	enum interfaces in = i - i2r;
++#ifdef RU
+ 	struct rdma_unicast *ru = fifo_first(&i->resolve_queue);
++#endif
+ 
+ 	ret = rdma_get_cm_event(i->rdma_events, &event);
+ 	if (ret) {
+@@ -2508,6 +2521,7 @@ static void handle_rdma_event(void *priv
+ 			goto err;
+ 			break;
+ 
++#ifdef RU
+ 		case RDMA_CM_EVENT_CONNECT_REQUEST:
+ 			{
+ 				struct rdma_conn_param rcp = { };
+@@ -2578,6 +2592,7 @@ static void handle_rdma_event(void *priv
+ 
+ 			goto err;
+ 			break;
++#endif
+ 
+ 		default:
+ 			logg(LOG_NOTICE, "RDMA Event handler:%s status: %d\n",
+@@ -2746,6 +2761,7 @@ static int send_to(struct rdma_channel *
+ 	return ret;
+ }
+ 
++#ifdef RU
+ /* Send buffer based on state in struct buf. Unicast only */
+ static int send_buf(struct buf *buf, struct rdma_unicast *ra)
+ {
+@@ -2769,6 +2785,7 @@ static struct rdma_unicast *new_rdma_uni
+ 	fifo_init(&ra->pending);
+ 	return ra;
+ }
++#endif
+ 
+ #ifdef RAW
+ static void setup_flow(struct rdma_channel *c)
+@@ -5135,6 +5152,7 @@ static struct i2r_interface *find_interf
+ 	return NULL;
+ }
+ 
++#ifdef RU
+ /* Ship a unicast datagram to an IP address .... */
+ static void send_buf_to(struct i2r_interface *i, struct buf *buf, struct sockaddr_in *sin)
+ {
+@@ -5167,6 +5185,7 @@ static void send_buf_to(struct i2r_inter
+ 
+ 	}
+ }
++#endif
+ 
+ static void beacon_send(void *private)
+ {

@@ -1,0 +1,42 @@
+Index: rdma-core/ib2roce/ib2roce.c
+===================================================================
+--- rdma-core.orig/ib2roce/ib2roce.c
++++ rdma-core/ib2roce/ib2roce.c
+@@ -925,6 +925,9 @@ static void __free_buffer(struct buf *bu
+ #ifdef DEBUG
+ 	memset(buf->raw, 0, DATA_SIZE);
+ #endif
++	if (buf->free)
++		abort();
++
+ 	buf->free = true;
+ 	buf->next = nextbuffer;
+ 	nextbuffer = buf;
+@@ -954,11 +957,9 @@ static void get_buf(struct buf *buf)
+ 
+ static void put_buf(struct buf *buf)
+ {
+-	unsigned count;
+-
+ 	lock();
+-	count = --buf->refcount;
+-	if (count) {
++	buf->refcount--;
++	if (buf->refcount) {
+ 		unlock();
+ 		return;
+ 	}
+@@ -1028,10 +1029,12 @@ static struct buf *alloc_buffer(struct r
+ 	buf = nextbuffer;
+ 
+ 	if (buf) {
++		if (!buf->free)
++			abort();
+ 		nextbuffer = buf->next;
+ 		buf->free = false;
++		buf->c = c;
+ 	}
+-	buf->c = c;
+ 	unlock();
+ 
+ #ifdef DEBUG

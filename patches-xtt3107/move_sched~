@@ -1,0 +1,750 @@
+Index: rdma-core/ib2roce/ib2roce.c
+===================================================================
+--- rdma-core.orig/ib2roce/ib2roce.c
++++ rdma-core/ib2roce/ib2roce.c
+@@ -80,6 +80,8 @@
+ #include "fifo.h"
+ #include "ring.h"
+ #include "hash.h"
++#include "sched.h"
++
+ #include "ibraw.h"
+ #include "cma-hdr.h"
+ 
+@@ -102,7 +104,6 @@ static unsigned default_port = 0;	/* Por
+ static unsigned default_mc_port = 4711;	/* Port for MC groups that do not have a port (if a port is required) */
+ static bool debug = false;		/* Stay in foreground, print more details */
+ static bool background = false;		/* Are we actually running in the background ? */
+-static bool terminated = false;		/* Daemon received a signal to terminate */
+ static bool update_requested = false;	/* Received SIGUSR1. Dump all MC data details */
+ static bool beacon = false;		/* Announce our presence (and possibly coordinate between multiple instances in the future */
+ static bool bridging = true;		/* Allow briding */
+@@ -125,28 +126,6 @@ static int max_iburst = 10;		/* Dont del
+ static int stat_interval = 10;		/* Interval for statistics */
+ static int loglevel = LOG_INFO;		/* LOG level for console output */
+ 
+-#define ONE_SECOND (1000000000UL)
+-#define ONE_MILLISECOND (ONE_SECOND/1000UL)
+-#define ONE_MICROSECOND (1000UL)
+-
+-/* Conversion of constants to microseconds */
+-#define seconds(x) ((x)*ONE_SECOND)
+-#define milliseconds(x) ((x)*ONE_MILLISECOND)
+-
+-
+-/* Timestamp in nanoseconds */
+-static uint64_t timestamp(void)
+-{
+-	struct timespec t;
+-
+-	clock_gettime(CLOCK_REALTIME, &t);
+-	return seconds(t.tv_sec) + t.tv_nsec;
+-}
+-
+-#define cpu_relax()	asm volatile("rep; nop")
+-
+-thread_local uint64_t now;		/* We do not want contention on this one */
+-
+ __attribute__ ((format (printf, 2, 3)))
+ static void logg(int prio, const char *fmt, ...);
+ 
+@@ -434,9 +413,6 @@ static inline void st(struct rdma_channe
+ }
+ 
+ /* Forwards */
+-static void add_event(uint64_t  when, event_callback *callback, void *private, const char *text);
+-static uint64_t run_events(void);
+-static void register_callback(void (*callback)(void *), int fd, void *private);
+ static void handle_comp_event(void *private);
+ static void handle_rdma_event(void *private);
+ static void handle_async_event(void *private);
+@@ -1410,18 +1386,39 @@ static void arm_channels(struct core_inf
+  *
+  * NOHZ should be enabled though to avoid hiccups from timer interrupts
+  */
+-static void *busyloop(void *private)
++static void scan_cqs(void *private)
+ {
+-	struct rdma_channel *c;
+-	int cqs;
++	struct core_info *core = private;
+ 	int i;
+-	unsigned cpu;
+-
++	int cqs;
++	struct rdma_channel *c;
+ 	struct ibv_wc wc[10];
+ 
+-	current = private;
++	for(i = 0; i < core->nr_channels; i++) {
++		cqs = ibv_poll_cq(core->channel[i].cq, 10, wc);
++		if (cqs) {
++			c = core->channel + i;
++
++			if (cqs > 0)
++				process_cqes(c, wc, cqs);
++			else {
++				logg(LOG_WARNING, "Busyloop: CQ polling failed with: %s on %s\n",
++						errname(), c->text);
++				core->state = core_err;
++				continue;
++			}
++		}
++	}
++}
++
++
++static void *busyloop(void *private)
++{
++	struct core_info *core = private;
++	unsigned cpu;
++
+ 	pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, NULL);
+-	numa_run_on_node(current->numa_node);
++	numa_run_on_node(core->numa_node);
+ 
+ 	current->state = core_init;
+ 
+@@ -1432,57 +1429,10 @@ static void *busyloop(void *private)
+ 	 * Initialize relevant data structures for this thread. These must be allocated
+ 	 * from the thread to ensure that they are thread local
+ 	 */
+-	arm_channels(current);
+-
+-	current->state = core_running;
+-
+-	now = timestamp(); 	/* Will be done by run_events in the future */
+-	do {
+-		uint64_t tdiff;
+-	
+-		cpu_relax();
+-		/* Scan CQs */
+-		for(i = 0; i < current->nr_channels; i++) {
+-			c = current->channel + i;
+-			cqs = ibv_poll_cq(c->cq, 10, wc);
+-			if (cqs) {
+-
+-				if (cqs > 0)
+-					process_cqes(c, wc, cqs);
+-				else {
+-					logg(LOG_ERR, "Busyloop: CQ polling failed with: %s on %s\n",
+-						errname(), c->text);
+-					current->state = core_err;
+-					continue;
+-				}
+-			}
+-		}
+-
+-
+-		if (latency) {
+-			tdiff = timestamp() - now;
+-
+-			if (tdiff > current->max_latency)
+-				current->max_latency = tdiff;
+-			if (tdiff < current->min_latency || !current->min_latency)
+-				current->min_latency = tdiff;
+-
+-			if (tdiff > 5000) {
+-				current->sum_latency += tdiff;
+-				current->samples++;
+-				if (current->samples > 1000000000) {
+-					current->samples = 1;
+-					current->sum_latency = tdiff;
+-				}
+-				if (tdiff > ONE_MILLISECOND)
+-					logg(LOG_NOTICE, "Busyloop took longer than a millisecond %ld\n", tdiff);
+-			}
+-		}
+-
+-		run_events();
+-
+-	} while (!terminated);
++	arm_channels(core);
+ 
++	core->state = core_running;
++	busy_event_loop(scan_cqs, core);
+ 	return NULL;
+ }
+ 
+@@ -5088,7 +5038,7 @@ static void handle_async_event(void *pri
+ 	 * We can make exceptions later.
+ 	 */
+ 
+-	terminated = true;
++	terminate(0);
+ 
+         ibv_ack_async_event(&event);
+ }
+@@ -5441,81 +5391,6 @@ static void beacon_setup(const char *opt
+ 	add_event(timestamp() + ONE_SECOND, beacon_send, NULL, "Send Beacon");
+ }
+ 
+-/* Events are timed according to nanoseconds in the current epoch */
+-struct timed_event {
+-	uint64_t time;		/* When should it occur */
+-	event_callback *callback;	/* function to run */
+-	void *private;
+-	struct timed_event *next;	/* The following event */
+-	const char *text;
+-};
+-
+-/* Event queues for each of the threads */
+-thread_local static struct timed_event *next_event;
+-
+-static void add_event(uint64_t time, event_callback *callback, void *private, const char *text)
+-{
+-	struct timed_event *t;
+-	struct timed_event *prior = NULL;
+-	struct timed_event *new_event;
+-
+-	new_event = calloc(1, sizeof(struct timed_event));
+-	new_event->time = time;
+-	new_event->callback = callback;
+-	new_event->private = private;
+-	new_event->text = text;
+-
+-	for(t = next_event; t && time > t->time; t = t->next)
+-		prior = t;
+-
+-	new_event->next = t;
+-
+-	if (prior)
+-		prior->next = new_event;
+-	else
+-		next_event = new_event;
+-}
+-
+-static int64_t time_to_next_event(void)
+-{
+-	if (next_event)
+-		return (long)next_event->time - (long)timestamp();
+-	else
+-		return 0;
+-}
+-
+-/*
+- * Run the next event if availabe and return the time till the next event
+- * or 0 if there is none
+- */
+-static uint64_t run_events(void)
+-{
+-	now = timestamp();
+-	while (next_event) {
+-		struct timed_event *te = next_event;
+-		uint64_t old_now;
+-
+-		if (te->time > now + ONE_MICROSECOND)
+-			return te->time - now;
+-	
+-		/* Time is up for an event */
+-		next_event = te->next;
+-		te->callback(te->private);
+-	
+-		if (latency) {
+-			old_now = now;
+-			now = timestamp();
+-			if (now - old_now > ONE_MILLISECOND)
+-				logg(LOG_ERR, "Callback %s took %ld nanoseconds which is longer than a millisecond\n",
+-					te->text, now-old_now);
+-		}
+-
+-		free(te);
+-	}
+-	return 0;
+-}
+-
+-
+ static void check_joins(void *private)
+ {
+ 	struct i2r_interface *i;
+@@ -5578,15 +5453,14 @@ static void calculate_pps(void *private)
+ 
+ static void brief_status(void)
+ {
+-	char buf[100];
+-	char buf2[150];
++	char buf[4000];
++	char buf2[4200];
+ 	char counts[200];
+ 
+ 	unsigned n = 0;
+ 	const char *events;
+ 
+-	for(struct timed_event *z = next_event; z; z = z->next)
+-		n += sprintf(buf + n, "%ldms,", (z->time - timestamp()) / ONE_MILLISECOND);
++	n = get_timer_list(buf, ',');
+ 
+ 	if (n > 0)
+ 		buf[n -1] = 0;
+@@ -5642,30 +5516,6 @@ static void logging(void *private)
+ 	add_event(timestamp() + seconds(10), logging, NULL, "Brief Status");
+ }
+ 
+-/*
+- * Logic to support building a pollfd table for the event loop
+- */
+-#define MAX_POLL_ITEMS 20
+-
+-unsigned poll_items = 0;
+-
+-struct pollfd pfd[MAX_POLL_ITEMS];
+-static void (*poll_callback[MAX_POLL_ITEMS])(void *);
+-void *poll_private[MAX_POLL_ITEMS];
+-
+-static void register_callback(void (*callback)(void *), int fd, void *private)
+-{
+-	struct pollfd e = { fd, POLLIN, 0};
+-
+-	if (poll_items == MAX_POLL_ITEMS)
+-		panic("Max poll items reached\n");
+-
+-	poll_callback[poll_items] = callback;
+-	pfd[poll_items] = e;
+-	poll_private[poll_items] = private;
+-	poll_items++;
+-}
+-
+ static void setup_timed_events(void)
+ {
+ 	now = timestamp();
+@@ -5715,67 +5565,6 @@ static void arm_channels(struct core_inf
+ }
+ 
+ 
+-static int event_loop(void)
+-{
+-	int64_t timeout;
+-	int events = 0;
+-	unsigned long t;
+- 
+-	arm_channels(NULL);
+-	setup_timed_events();
+-
+-loop:
+-	if (terminated)
+-		goto out;
+-
+-	timeout = time_to_next_event();
+-	if (timeout) {
+-		/*
+-		 * If we come from processing poll events then
+-		 * give priority to more poll event processing
+-		 */
+-		if ((timeout <= 0 && events == 0) ||
+-			       timeout < -(long)milliseconds(10))
+-
+-			timeout = run_events();
+-
+-	}
+-	
+-	if (timeout <= 0 || timeout > (long)seconds(10))
+-		timeout = seconds(10);
+- 
+- 	events = poll(pfd, poll_items, (timeout + ONE_MILLISECOND/2) / ONE_MILLISECOND);
+-
+-	if (terminated)
+-		goto out;
+-
+-	if (events < 0) {
+-		logg(LOG_WARNING, "Poll failed with error=%s\n", errname());
+-		goto out;
+-	}
+-
+-	if (events == 0)
+-		goto loop;
+-
+-	for(t = 0; t < poll_items; t++)
+-		if (pfd[t].revents & POLLIN)
+-			poll_callback[t](poll_private[t]);
+-
+-	goto loop;
+-out:
+-	return 0;
+-}
+-
+-/*
+- * Daemon Management functions
+- */
+-
+-static void terminate(int x)
+-{
+-	terminated = true;
+-}
+-
+-
+ static void update_status(int x)
+ {
+ 	update_requested = true;
+@@ -6495,12 +6284,17 @@ static void tsi_cmd(char *parameters)
+ 
+ static void event_cmd(char *parameters)
+ {
++	char buffer[4000];
++	int n;
++
+ 	printf("Scheduled events on the high latency thread\n");
+ 	printf("-------------------------------------------\n");
+ 
+-	for(struct timed_event *z = next_event; z; z = z->next) {
+-		printf("%ldms %s\n", (z->time - timestamp()) / ONE_MILLISECOND, z->text);
+-	}
++	n = get_timer_list(buffer, '\n');
++	if (n)
++		printf("%s\n", buffer);
++	else
++		printf("No events.\n");
+ }
+ 
+ static int log_interval;
+@@ -6587,7 +6381,7 @@ static void console_input(void *private)
+ 
+ 	if (ret == 0) {
+ 		printf("\n");
+-		terminated = true;
++		terminate(0);
+ 		return;
+ 	}
+ 
+@@ -6707,8 +6501,11 @@ int main(int argc, char **argv)
+ 	send_queue_monitor(NULL);
+ 
+ 	start_cores();
++	arm_channels(NULL);
++	setup_timed_events();
+ 
+-	event_loop();
++	if (event_loop() <0)
++		logg(LOG_ERR, "Event Loop failed with %s\n", errname());
+ 
+ 	stop_cores();
+ 
+Index: rdma-core/ib2roce/sched.c
+===================================================================
+--- /dev/null
++++ rdma-core/ib2roce/sched.c
+@@ -0,0 +1,236 @@
++/*
++ * RDMA Infiniband to ROCE Bridge or Gateway
++ *
++ * (C) 2021-2022 Christoph Lameter <cl@linux.com>
++ *
++ * This software is available to you under a choice of one of two
++ * licenses.  You may choose to be licensed under the terms of the GNU
++ * General Public License (GPL) Version 2, available from the file
++ * COPYING in the main directory of this source tree, or the
++ * OpenIB.org BSD license below:
++ *
++ *     Redistribution and use in source and binary forms, with or
++ *     without modification, are permitted provided that the following
++ *     conditions are met:
++ *
++ *      - Redistributions of source code must retain the above
++ *        copyright notice, this list of conditions and the following
++ *        disclaimer.
++ *
++ *      - Redistributions in binary form must reproduce the above
++ *        copyright notice, this list of conditions and the following
++ *        disclaimer in the documentation and/or other materials
++ *        provided with the distribution.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++ * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
++ * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
++ * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
++ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ *
++ * $Author: Christoph Lameter [cl@linux.com]$
++ *
++ */
++
++#define _GNU_SOURCE
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <stdbool.h>
++#include <stdarg.h>
++#include <unistd.h>
++#include <signal.h>
++#include <sys/types.h>
++#include <sys/stat.h>
++#include <syslog.h>
++#include <fcntl.h>
++#include <ctype.h>
++#include <pthread.h>
++#include <threads.h>
++#include <numa.h>
++#include <stdatomic.h>
++#include <sys/ioctl.h>
++#include <poll.h>
++#include <sys/mman.h>
++
++#include "sched.h"
++
++#include "errno.h"
++
++#define ONE_SECOND (1000000000UL)
++#define ONE_MILLISECOND (ONE_SECOND/1000UL)
++#define ONE_MICROSECOND (1000UL)
++
++/* Timestamp in nanoseconds */
++uint64_t timestamp(void)
++{
++	struct timespec t;
++
++	clock_gettime(CLOCK_REALTIME, &t);
++	return t.tv_sec * ONE_SECOND + t.tv_nsec;
++}
++
++thread_local uint64_t now;
++
++static bool terminated = false;
++
++/*
++ * Logic to support building a pollfd table for the event loop
++ */
++#define MAX_POLL_ITEMS 20
++
++unsigned poll_items = 0;
++
++static struct pollfd pfd[MAX_POLL_ITEMS];
++static void (*poll_callback[MAX_POLL_ITEMS])(void *);
++void *poll_private[MAX_POLL_ITEMS];
++
++void register_callback(event_callback *callback, int fd, void *private)
++{
++	struct pollfd e = { fd, POLLIN, 0};
++
++	if (poll_items == MAX_POLL_ITEMS)
++		abort();
++
++	poll_callback[poll_items] = callback;
++	pfd[poll_items] = e;
++	poll_private[poll_items] = private;
++	poll_items++;
++}
++
++/* Events are timed according to nanoseconds in the current epoch */
++struct timed_event {
++	uint64_t time;          /* When should it occur */
++	event_callback *callback;       /* function to run */
++	void *private;
++	struct timed_event *next;       /* The following event */
++	const char *text;
++};
++
++/* Event queues for each of the threads */
++thread_local static struct timed_event *next_event;
++
++int64_t time_to_next_event(void)
++{
++	if (next_event)
++		return (long)next_event->time - (long)timestamp();
++	else
++		return 0;
++}
++
++int get_timer_list(char *buf, char separator)
++{
++	int n = 0;
++
++	for(struct timed_event *z = next_event; z; z = z->next)
++		n += sprintf(buf + n, "%ldms%c", (z->time - timestamp()) / ONE_MILLISECOND, separator);
++
++	return n;
++}
++
++void add_event(uint64_t time, event_callback *callback, void *private, const char *text)
++{
++	struct timed_event *t;
++	struct timed_event *prior = NULL;
++	struct timed_event *new_event;
++
++	new_event = calloc(1, sizeof(struct timed_event));
++	new_event->time = time;
++	new_event->callback = callback;
++	new_event->private = private;
++	new_event->text = text;
++
++	for(t = next_event; t && time > t->time; t = t->next)
++		prior = t;
++
++	new_event->next = t;
++
++	if (prior)
++		prior->next = new_event;
++	else
++		next_event = new_event;
++}
++
++/*
++ * Run the next event if availabe and return the time till the next event
++ * or 0 if there is none
++ */
++uint64_t run_events(void)
++{
++	while (next_event) {
++		struct timed_event *te = next_event;
++
++		now = timestamp();
++
++		if (te->time > now + ONE_MICROSECOND)
++			return te->time - now;
++
++		/* Time is up for an event */
++		next_event = te->next;
++		te->callback(te->private);
++		free(te);
++	}
++	return 0;
++}
++
++
++void terminate(int x)
++{
++	terminated = true;
++}
++
++int event_loop(void)
++{
++	int64_t timeout;
++	int events = 0;
++
++	while (!terminated) {
++
++		timeout = time_to_next_event();
++		if (timeout) {
++			/*
++			 * If we come from processing poll events then
++			 * give priority to more poll event processing
++			 */
++			if ((timeout <= 0 && events == 0) ||
++				       timeout < -(long)milliseconds(10))
++
++				timeout = run_events();
++
++		}
++
++		if (timeout <= 0 || timeout > (long)seconds(10))
++			timeout = seconds(10);
++
++	 	events = poll(pfd, poll_items, (timeout + ONE_MILLISECOND/2) / ONE_MILLISECOND);
++
++		if (events < 0)
++			return - 1;
++
++		if (events > 0) {
++			unsigned t;
++
++			for(t = 0; t < poll_items; t++)
++				if (pfd[t].revents & POLLIN)
++					poll_callback[t](poll_private[t]);
++		}
++	}
++	return 0;
++}
++
++int busy_event_loop(event_callback *callback, void *private)
++{
++
++
++	while (!terminated) {
++		cpu_relax();
++		callback(private);
++		run_events();
++	}
++	return 0;
++}
++
++
+Index: rdma-core/ib2roce/sched.h
+===================================================================
+--- /dev/null
++++ rdma-core/ib2roce/sched.h
+@@ -0,0 +1,72 @@
++#ifndef IB2ROCE_SCHED_H
++#define IB2ROCE_SCHED_H
++/*
++ * RDMA Infiniband to ROCE Bridge or Gateway
++ *
++ * (C) 2021-2022 Christoph Lameter <cl@linux.com>
++ *
++ * This software is available to you under a choice of one of two
++ * licenses.  You may choose to be licensed under the terms of the GNU
++ * General Public License (GPL) Version 2, available from the file
++ * COPYING in the main directory of this source tree, or the
++ * OpenIB.org BSD license below:
++ *
++ *     Redistribution and use in source and binary forms, with or
++ *     without modification, are permitted provided that the following
++ *     conditions are met:
++ *
++ *      - Redistributions of source code must retain the above
++ *        copyright notice, this list of conditions and the following
++ *        disclaimer.
++ *
++ *      - Redistributions in binary form must reproduce the above
++ *        copyright notice, this list of conditions and the following
++ *        disclaimer in the documentation and/or other materials
++ *        provided with the distribution.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++ * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
++ * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
++ * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
++ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ *
++ * $Author: Christoph Lameter [cl@linux.com]$
++ *
++ */
++
++#define _GNU_SOURCE
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <stdint.h>
++#include <sys/types.h>
++
++/* Time keeping */
++#define ONE_SECOND (1000000000UL)
++#define ONE_MILLISECOND (ONE_SECOND/1000UL)
++#define ONE_MICROSECOND (1000UL)
++
++#define seconds(x) ((x)*ONE_SECOND)
++#define milliseconds(x) ((x)*ONE_MILLISECOND)
++
++uint64_t timestamp(void);
++extern thread_local uint64_t now;
++
++#define cpu_relax()	asm volatile("rep; nop")
++
++typedef void event_callback(void *);
++void add_event(uint64_t when, event_callback *callback, void *private, const char *text);
++void register_callback(event_callback *callback, int fd, void *private);
++
++int64_t time_to_next_event(void);	/* Time till next event */
++uint64_t run_events(void);	/* Run events that are scheduled */
++int event_loop(void);		/* Enter loop running events and servicing fd callbacks */
++int busy_event_loop(event_callback *callback, void *private);	/* Enter loop running events and servicing fd callbacks */
++void terminate(int x);		/* Terminate the event loop */
++
++int get_timer_list(char *b, char separator);	/* List the timers and put the data into the buffer */
++
++#endif
+Index: rdma-core/ib2roce/CMakeLists.txt-NO_MSTFLINT
+===================================================================
+--- rdma-core.orig/ib2roce/CMakeLists.txt-NO_MSTFLINT
++++ rdma-core/ib2roce/CMakeLists.txt-NO_MSTFLINT
+@@ -7,6 +7,7 @@ rdma_executable(ib2roce
+   hash.c
+   errno.c
+   ring.c
++  sched.c
+ )
+ target_link_libraries(ib2roce LINK_PRIVATE
+   ibverbs

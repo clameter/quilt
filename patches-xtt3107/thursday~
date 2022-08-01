@@ -2,66 +2,104 @@ Index: rdma-core/ib2roce/ib2roce.c
 ===================================================================
 --- rdma-core.orig/ib2roce/ib2roce.c
 +++ rdma-core/ib2roce/ib2roce.c
-@@ -603,11 +603,13 @@ const char *mc_text[NR_MC_STATUS] = { "I
-  */
- static struct mc {
- 	struct in_addr addr;
-+	struct ah_info ai[2];
-+	unsigned long last_sent[2];	/* Timestamp of last packet sent */
-+	unsigned pending[2];		/* Number of packets to be sent later */
- 	enum mc_status status[2];
- 	bool sendonly[2];
- 	bool beacon;
- 	uint16_t port;
--	struct ah_info ai[2];
- 	struct sockaddr *sa[2];
- 	struct mgid_signature *mgid_mode;
- 	const char *text;
-@@ -3422,8 +3424,8 @@ redo:
- 		return NULL;
- 	}
+@@ -87,7 +87,7 @@
  
--	if (rate)
--		at->static_rate = rate;
-+	if (hwrate)
-+		at->static_rate = hwrate;
+ #define BEACON_SIGNATURE 0xD3ADB33F
+ 
+-// #define HAVE_MSTFLINT
++#define HAVE_MSTFLINT
+ // #define DEBUG
+ 
+ /* Globals */
+@@ -1036,7 +1036,7 @@ static int post_receive(struct rdma_chan
+ 		ret = ibv_post_recv(c->qp, &recv_wr, &recv_failure);
+ 		if (ret) {
+ 			free_buffer(buf);
+-			logg(LOG_WARNING, "ibv_post_recv failed: %s\n", errname());
++			logg(LOG_WARNING, "ibv_post_recv failed: %s:%s\n", c->text, errname());
+ 			break;
+                 }
+ 		c->active_receive_buffers++;
+@@ -1223,7 +1223,7 @@ static void start_channel(struct rdma_ch
+ 				logg(LOG_CRIT, "ibv_modify_qp: Error when moving %s to RTS state. %s\n", c->text, errname());
+ 
+ 		}
+-		logg(LOG_NOTICE, "QP %s moved to state %s\n", c->text,  send ? "RTS/RTR" : "RTR" );
++		logg(LOG_NOTICE, "QP %s moved to state %s: QPN=0x%x\n", c->text,  send ? "RTS/RTR" : "RTR", c->qp->qp_num);
+ 	}
+ }
+ 
+@@ -2066,9 +2066,9 @@ static int send_ud(struct rdma_channel *
+ 		errno = - ret;
+ 		logg(LOG_WARNING, "Failed to post send: %s on %s\n", errname(), c->text);
+ 	} else
+-		if (log_packets > 1)
+-			logg(LOG_NOTICE, "RDMA Send to QPN=%x QKEY=%x %d bytes\n",
+-				wr.wr.ud.remote_qpn, wr.wr.ud.remote_qkey, len);
++//	if (log_packets > 1)
++			logg(LOG_NOTICE, "RDMA Send to %s QPN=%x QKEY=%x %d bytes AH=%p handle=%x pd=%p context=%p\n", c->text,
++				wr.wr.ud.remote_qpn, wr.wr.ud.remote_qkey, len, ah, ah->handle, ah->pd, ah->context);
+ 
+ 	return ret;
+ }
+@@ -2438,7 +2438,7 @@ static struct endpoint *at_to_ep(struct
+ 		at->static_rate = id->route.path_rec->rate;
+ 		if (at->port_num != id->port_num)
+ 			abort();
+-
++		logg(LOG_NOTICE, "%s: Lookup of %s resulted in DLID=%x\n", i->text, inet_ntoa(addr), at->dlid);
+ 		rdma_destroy_id(id);
+ 
+ 	}
+@@ -2455,10 +2455,11 @@ static struct endpoint *at_to_ep(struct
  
  	ah = ibv_create_ah(i->pd, at);
  	if (!ah) {
-@@ -3687,11 +3689,27 @@ static void receive_multicast(struct buf
- 	if (drop_packets && (c->stats[packets_received] % drop_packets) == drop_packets - 1)
+-		logg(LOG_ERR, "create_ep: Failed to create Endpoint on %s: %s. IP=%s\n",
++		logg(LOG_ERR, "at_to_ep: Failed to create Endpoint on %s: %s. IP=%s\n",
+ 				i->text, errname(), inet_ntoa(ep->addr));
+ 		return NULL;
+-	}
++	} else
++		logg(LOG_NOTICE, "at_to_ep %s: AH=%p created from %s LID =%x\n", i->text, ah, inet_ntoa(addr), at->dlid); 
+ 
+ 	ep = calloc(1, sizeof(struct endpoint));
+ 	if (!ep)
+@@ -2588,7 +2589,7 @@ static void learn_source_address(struct
+ 	if (!unicast)	/* If unicast is not enabled then dont bother to gather addresses */
  		return;
  
-+	if (swrate && m->last_sent[in]) {
-+		unsigned long tdiff = timestamp() - m->last_sent[in];
-+
-+		if (tdiff < ((m->pending[in] + 1) * 10000000) / swrate) {
-+			m->pending[in]++;
-+			add_event(m->last_sent[in] + (m->pending[in] * 1000000) / swrate, send_delayed);
-+			/* Schedule packet somewhere */
-+			return;
-+
-+		}
-+	} 
- 	ret = send_to(i2r[in ^ 1].multicast, buf->cur, buf->end - buf->cur, m->ai + (in ^ 1), false, 0, buf);
+-	buf_to_ep(buf);
++	buf->source_ep = buf_to_ep(buf);
+ }
  
- 	if (ret)
- 		return;
+ /*
+@@ -3126,12 +3127,12 @@ static void receive_raw(struct buf *buf)
+ 		w->sl = ib_get_sl(ih);
  
-+	if (swrate) {
-+		m->last_sent[in] = timestamp();
-+		m->pending[in] = 0;
-+	}
+ 		if (!unicast_lid(w->slid) || !lids[1]) {
+-			logg(LOG_NOTICE, "SLID=%x DLID=%x\n", lids[0], lids[1]);
+ 			reason = "Invalid SLID or DLID";
+ 			goto discard;
+ 		}
+ 
+ 		if (w->slid == i->port_attr.lid) {
++			logg(LOG_NOTICE, "SLID=%x DLID=%x len=%d %s\n", lids[0], lids[1], len, payload_dump(buf->raw));
+ 			reason = "Unicast Loopback";
+ 			goto discard;
+ 		}
+@@ -3360,9 +3361,14 @@ static void receive_ud(struct buf *buf)
+ 	struct endpoint *e;
+ 	struct forward *f;
+ 	struct ibv_wc *w = buf->w;
++	char e_str[40];
+ 
+ 	learn_source_address(buf);
+ 
++	if (!buf->grh_valid)
++		/* Even if there is no GRH there is space reserved at the beginning for UD packets */
++		buf->cur += 40;
 +
- 	st(c, packets_bridged);
- 	return;
- 
-@@ -5380,7 +5398,7 @@ struct enable_option {
- { "loopbackprev",	&loopback_blocking, NULL, "on", "off",	"Multicast loopback prevention of the NIC" },
- { "packetsocket",	&packet_socket, NULL,	"on", "off",	"Use a packet socket instead of a RAW QP to capure IB/ROCE traffic" },
- { "pgm",		NULL,	(int *)&pgm_mode, "on", "off",	"PGM processing mode (0=None, 1= Passtrough, 2=DLR, 3=Resend with new TSI" },
--{ "hwrate",		NULL,	&rate,		"2", "0",	"Set the speed in the RDMA NIC to limit the output speed 2 =2.5GBPS 5 = 5GBPS 3 = 10GBPS ...(see enum ibv_rate)" },
-+{ "hwrate",		NULL,	&hwrate,	"2", "0",	"Set the speed in the RDMA NIC to limit the output speed 2 =2.5GBPS 5 = 5GBPS 3 = 10GBPS ...(see enum ibv_rate)" },
- { "swrate",		NULL, &swrate,		"1000", "0",	"Limit the packets per second to be sent to an endpoint (0=off)" },
- { "raw",		&raw,	NULL,		"on", "off",	"Use of RAW sockets to capture SIDR Requests. Avoids having to use a patched kernel" },
- { "unicast",		&unicast, NULL,		"on", "off",	"Processing of unicast packets with QP1 handling of SIDR REQ/REP" },
+ 	e = buf->source_ep;
+ 	if (!e) {
+ 		reason = "Cannot find endpoint";

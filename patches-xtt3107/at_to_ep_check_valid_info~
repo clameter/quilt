@@ -1,0 +1,21 @@
+Index: rdma-core/ib2roce/ib2roce.c
+===================================================================
+--- rdma-core.orig/ib2roce/ib2roce.c
++++ rdma-core/ib2roce/ib2roce.c
+@@ -2374,6 +2374,16 @@ static struct endpoint *at_to_ep(struct
+ 
+ 	}
+ 
++	if (addr.s_addr && !addr_valid(i, addr)) {
++		logg(LOG_ERR, "at_to_ep: %s Invalid address %s\n", i->text, inet_ntoa(addr))
++		return NULL;
++	}
++
++	if (!unicast_lid(at->dlid)) {
++		logg(LOG_ERR, "at_to_ep: %s Invalid LID %x\n", i->text, at->dlid);
++		return NULL;
++	}
++
+ 	ah = ibv_create_ah(i->pd, at);
+ 	if (!ah) {
+ 		logg(LOG_ERR, "create_ep: Failed to create Endpoint on %s: %s. IP=%s\n",

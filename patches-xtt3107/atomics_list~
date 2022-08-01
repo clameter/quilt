@@ -35,24 +35,8 @@ Index: rdma-core/ib2roce/ib2roce.c
  }
  
  static void get_buf(struct buf *buf)
-@@ -989,19 +991,34 @@ static void init_buf(void)
- 		free_buffer(&buffers[i-1]);
- }
+@@ -986,17 +988,24 @@ static void init_buf(void)
  
-+static bool buf_cmpxchg(struct buf **x, struct buf *y, struct buf *z)
-+{
-+	if (multithreaded) {
-+		return atomic_compare_exchange_weak(x, &y, z);
-+
-+	} else {
-+		if (*x == y) {
-+			*x = z;
-+			return true;
-+		}
-+		return false;
-+	}
-+}
-+
  static struct buf *alloc_buffer(struct rdma_channel *c)
  {
 -	struct buf *buf;
@@ -60,17 +44,21 @@ Index: rdma-core/ib2roce/ib2roce.c
  
 -	lock();
 -	buf = nextbuffer;
-+	do {
-+		buf = nextbuffer;
-+		if (!buf)
-+			return NULL;
++	if (multithreaded) {
++		do {
++			buf = nextbuffer;
++			if (!buf)
++				return NULL;
  
 -	if (buf) {
--		nextbuffer = buf->next;
++			next = buf->next;
++		} while (!atomic_compare_exchange_weak(&nextbuffer, &buf, next));
++
++	} else {
++		buf = nextbuffer;
+ 		nextbuffer = buf->next;
 -		buf->free = false;
--	}
-+		next = buf->next;
-+	} while (!buf_cmpxchg(&nextbuffer, buf, next));
+ 	}
 +
 +	buf->free = false;
  	buf->c = c;

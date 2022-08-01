@@ -148,10 +148,10 @@ Index: rdma-core/ib2roce/CMakeLists.txt-NO_MSTFLINT
 ===================================================================
 --- rdma-core.orig/ib2roce/CMakeLists.txt-NO_MSTFLINT
 +++ rdma-core/ib2roce/CMakeLists.txt-NO_MSTFLINT
-@@ -11,6 +11,7 @@ rdma_executable(ib2roce
-   buffers.c
-   locking.c
-   logging.c
+@@ -8,6 +8,7 @@ rdma_executable(ib2roce
+   errno.c
+   ring.c
+   sched.c
 +  pim.c
  )
  target_link_libraries(ib2roce LINK_PRIVATE

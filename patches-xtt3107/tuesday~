@@ -1,83 +1,125 @@
-Index: rdma-core/ib2roce/cma-hdr.h
-===================================================================
---- rdma-core.orig/ib2roce/cma-hdr.h
-+++ rdma-core/ib2roce/cma-hdr.h
-@@ -10,7 +10,8 @@ union cma_ip_addr {
- 	struct in6_addr ip6;
- 	struct {
- 		__be32 qpn;
--		__be32 pad[2];
-+		__be32 qkey;
-+		__be32 pad[1];
- 		__be32 addr;
- 	} ip4;
- };
 Index: rdma-core/ib2roce/ib2roce.c
 ===================================================================
 --- rdma-core.orig/ib2roce/ib2roce.c
 +++ rdma-core/ib2roce/ib2roce.c
-@@ -1953,8 +1953,7 @@ static void setup_interface(enum interfa
- 	if (i->iges <= 0) {
- 		logg(LOG_CRIT, "Error %s. Failed to obtain GID table for %s\n",
- 			errname(), i->text);
--		i->context = NULL;
--		return;
-+		abort();
+@@ -1184,6 +1184,7 @@ err:
+ }
+ 
+ static void process_cqes(struct rdma_channel *c, struct ibv_wc *w, unsigned cqs);
++static void arm_channels(struct core_info *core);
+ 
+ /*
+  * Polling function for each core enabling low latency operations.
+@@ -1440,12 +1441,16 @@ static void post_receive(struct rdma_cha
  	}
+ }
  
- 	/* Find the correct gid entry */
-@@ -1972,10 +1971,9 @@ static void setup_interface(enum interfa
- 	}
+-static void post_receive_buffers(struct i2r_interface *i)
++static void post_receive_buffers(void)
+ {
+-	post_receive(i->multicast);
+-	post_receive(i->raw);
+-	post_receive(i->qp1);
+-	post_receive(i->ud);
++	struct i2r_interface *i;
++
++	for(i = i2r; i < i2r + NR_INTERFACES; i++) {
++		post_receive(i->multicast);
++		post_receive(i->raw);
++		post_receive(i->qp1);
++		post_receive(i->ud);
++	}
+ }
  
- 	if (e >= i->ige + i->iges) {
--		logg(LOG_CRIT, "Failed to find a suitable entry GID table for %s\n",
-+		logg(LOG_CRIT, "Failed to find GIDs in GID table for %s\n",
- 			i->text);
--		i->context = NULL;
--		return;
-+		abort();
- 	}
  
- 	/* Copy our connection info from GID table */
-@@ -2946,7 +2944,7 @@ redo:
- 	ah = ibv_create_ah(i->pd, at);
- 	if (!ah) {
- 		logg(LOG_ERR, "at_to_ep: Failed to create Endpoint on %s: %s. IP=%s\n",
--				i->text, errname(), inet_ntoa(ep->addr));
-+				i->text, errname(), inet_ntoa(addr));
- 		return NULL;
- 	}
+@@ -1753,12 +1758,11 @@ static bool setup_channel(struct rdma_ch
+ 	struct ibv_qp_init_attr_ex init_qp_attr_ex;
  
-@@ -3456,7 +3454,10 @@ static const char *sidr_req(struct buf *
- 	}
+ 	c->mr = i->mr;
++	c->pd = i->pd;
  
- 	ss->source = buf->source_ep;
--	ss->source_qp = ch->src_addr.ip4.qpn;
-+	ss->source_qp = ntohl(ch->src_addr.ip4.qpn);
-+	logg(LOG_NOTICE, "SDIR_REQ CMA info = SRC QP=%x QKEY=%d DST QP=%x QKEY=%x\n",
-+		ntohl(ch->src_addr.ip4.qpn), ntohl(ch->src_addr.ip4.qkey),
-+		ntohl(ch->dst_addr.ip4.qpn), ntohl(ch->dst_addr.ip4.qkey));
- 	ss->request_id = sr->request_id;
+ 	if (!c->core)
+ 		c->comp_events = i->comp_events;
  
- no_cma:
-@@ -5149,7 +5150,7 @@ int main(int argc, char **argv)
- 	if (ret && !testing)
- 		return ret;
- 
--	logg (LOG_NOTICE, "%s device = %s:%d, %s device = %s:%d. Multicast Groups=%d MGIDs=%s Buffers=%u\n",
-+	syslog (LOG_NOTICE, "%s device = %s:%d, %s device = %s:%d. Multicast Groups=%d MGIDs=%s Buffers=%u\n",
- 			interfaces_text[INFINIBAND], i2r[INFINIBAND].rdma_name, i2r[INFINIBAND].port,
- 			interfaces_text[ROCE], i2r[ROCE].rdma_name, i2r[ROCE].port,
- 			nr_mc, mgid_mode->id, nr_buffers);
-@@ -5159,11 +5160,6 @@ int main(int argc, char **argv)
- 	setup_interface(INFINIBAND);
- 	setup_interface(ROCE);
- 
--	if (!i2r[INFINIBAND].context && !i2r[ROCE].context) {
--		logg(LOG_CRIT, "No working RDMA devices present.\n");
--		exit(2);
--	}
+-	c->pd = i->pd;
 -
- 	if (cores)
- 		show_core_config();
+ 	c->cq = ibv_create_cq(i->context, c->nr_cq, c, c->comp_events, 0);
+ 	if (!c->cq) {
+ 		logg(LOG_CRIT, "ibv_create_cq failed for %s.\n",
+@@ -4575,32 +4579,32 @@ static void setup_timed_events(void)
+ 	add_event(t + 100, check_joins);
+ }
  
+-static void arm_channels(void)
++static void arm_channels(struct core_info *core)
+ {
+ 	struct i2r_interface *i;
+ 
+ 	for(i = i2r; i < i2r + NR_INTERFACES; i++)
+ 	   if (i->context) {
+-		/* Receive Buffers */
+-		post_receive_buffers(i);
++
+ 		/* And request notifications if something happens */
+-		if (i->multicast) {
++		if (i->multicast && core == i->multicast->core) {
+ 			ibv_req_notify_cq(i->multicast->cq, 0);
+ 		}
+ 
+-		if (i->raw && (i->raw->type == channel_raw || i->raw->type == channel_ibraw)) {
++		if (i->raw && core == i->raw->core &&
++			       (i->raw->type == channel_raw || i->raw->type == channel_ibraw)) {
+ 			start_channel(i->raw);
+ 			ibv_req_notify_cq(i->raw->cq, 0);
+ 
+ 			setup_flow(i->raw);
+ 		}
+ 
+-		if (i->ud) {
++		if (i->ud && core == i->ud->core) {
+ 			start_channel(i->ud);
+ 			ibv_req_notify_cq(i->ud->cq, 0);
+ 		}
+ 
+-		if (i->qp1) {
++		if (i->qp1 && core == i->qp1->core) {
+ 			start_channel(i->qp1);
+ 			ibv_req_notify_cq(i->qp1->cq, 0);
+ 		}
+@@ -4616,8 +4620,6 @@ static int event_loop(void)
+ 	int waitms;
+ 	unsigned long t;
+ 
+-	arm_channels();
+-	setup_timed_events();
+ loop:
+ 	timeout = 10000;
+ 
+@@ -5078,8 +5080,6 @@ int main(int argc, char **argv)
+ 		exec_opt(op, optarg);
+ 	}
+ 
+-	init_buf();
+-
+ 	if (debug || !bridging)
+ 		openlog("ib2roce", LOG_PERROR, LOG_USER);
+ 	else {
+@@ -5116,11 +5116,16 @@ int main(int argc, char **argv)
+ 		beacon_setup(beacon_arg);
+ 
+ 	register_poll_events();
++	setup_timed_events();
+ 
+-	start_cores();
++	numa_run_on_node(i2r[INFINIBAND].context ? i2r[INFINIBAND].numa_node : i2r[ROCE].numa_node);
++	init_buf();
++	numa_run_on_node(-1);
+ 
++	post_receive_buffers();
++	start_cores();
++	arm_channels(NULL);
+ 	event_loop();
+-
+ 	stop_cores();
+ 
+ 	if (background)

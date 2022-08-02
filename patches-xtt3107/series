@@ -3,9 +3,9 @@ consolidate_code_for_packet_check
 check_reverse_path
 callback_for_beacon
 move_sched
-move_buf
 move_lock
-mov_logging
+move_buf
+move_mc
 create_pim_infrastructure
 traff_class_instead
 raw

@@ -2,10 +2,10 @@ Index: rdma-core/ib2roce/CMakeLists.txt-NO_MSTFLINT
 ===================================================================
 --- rdma-core.orig/ib2roce/CMakeLists.txt-NO_MSTFLINT
 +++ rdma-core/ib2roce/CMakeLists.txt-NO_MSTFLINT
-@@ -9,6 +9,7 @@ rdma_executable(ib2roce
-   ring.c
+@@ -10,6 +10,7 @@ rdma_executable(ib2roce
    sched.c
-   buffers.c
+   channel.c
+   logging.c
 +  locking.c
  )
  target_link_libraries(ib2roce LINK_PRIVATE
@@ -14,7 +14,7 @@ Index: rdma-core/ib2roce/locking.c
 ===================================================================
 --- /dev/null
 +++ rdma-core/ib2roce/locking.c
-@@ -0,0 +1,123 @@
+@@ -0,0 +1,122 @@
 +/*
 + * RDMA Infiniband to ROCE Bridge or Gateway
 + *
@@ -78,7 +78,7 @@ Index: rdma-core/ib2roce/locking.c
 +#include <infiniband/verbs.h>
 +#include <poll.h>
 +#include <sys/mman.h>
-+
++#include "errno.h"
 +#include "logging.h"
 +#include "locking.h"
 +
@@ -102,7 +102,7 @@ Index: rdma-core/ib2roce/locking.c
 +
 +	locked = true;
 +}
-+ 
++
 +void unlock(void)
 +{
 +	if (!locked)
@@ -115,7 +115,7 @@ Index: rdma-core/ib2roce/locking.c
 +
 +	}
 +}
-+ 
++
 +#if 0
 +bool trylock(void)
 +{
@@ -137,12 +137,14 @@ Index: rdma-core/ib2roce/locking.c
 +}
 +#endif
 +
-+
 Index: rdma-core/ib2roce/locking.h
 ===================================================================
 --- /dev/null
 +++ rdma-core/ib2roce/locking.h
-@@ -0,0 +1,55 @@
+@@ -0,0 +1,60 @@
++#ifndef IB2ROCE_LOCKING
++#define IB2ROCE_LOCKING
++
 +/*
 + * Simple global locking
 + *
@@ -193,8 +195,84 @@ Index: rdma-core/ib2roce/locking.h
 +#include <pthread.h>
 +
 +/* Are we running concurrent threads ? */
-+bool multithreaded = false;
++extern bool multithreaded;
 +
 +void lock(void);
 +void unlock(void);
 +
++#endif
++
+Index: rdma-core/ib2roce/ib2roce.c
+===================================================================
+--- rdma-core.orig/ib2roce/ib2roce.c
++++ rdma-core/ib2roce/ib2roce.c
+@@ -81,6 +81,7 @@
+ #include "hash.h"
+ #include "sched.h"
+ #include "logging.h"
++#include "locking.h"
+ 
+ #include "ibraw.h"
+ #include "cma-hdr.h"
+@@ -133,61 +134,6 @@ static const char *inet6_ntoa(void *x)
+ 	return inet_ntop(AF_INET6, x, buf, INET6_ADDRSTRLEN);
+ }
+ 
+-static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;		/* Generic serialization mutex */
+-
+-/* Is the lock taken */
+-bool locked = false;
+-
+-/* Are we running concurrent threads ? */
+-bool multithreaded = false;
+-
+-static void lock(void)
+-{
+-	if (multithreaded) {
+- 		if (pthread_mutex_lock(&mutex))
+- 			logg(LOG_CRIT, "Mutex lock failed: %s\n", errname());
+-	}
+-
+-	if (locked)
+-	       	panic("lock() called when already locked\n");
+-
+-	locked = true;
+-}
+- 
+-static void unlock(void)
+-{
+-	if (!locked)
+-		panic("unlock() called when not locked\n");
+-
+-	locked = false;
+-	if (multithreaded) {
+- 		if (pthread_mutex_unlock(&mutex))
+- 			panic("Mutex unlock failed: %s\n", errname());
+-
+-	}
+-}
+- 
+-#if 0
+-static bool trylock(void)
+-{
+-	if (multithreaded) {
+- 		if (pthread_mutex_trylock(&mutex)) {
+- 			if (errno != EBUSY)
+- 				logg(LOG_ERR, "Mutex trylock failed: %s\n", errname());
+- 			return false;
+- 		}
+-	} else {
+-		if (locked)
+-			abort();
+-	}
+-
+-	locked = true;
+-
+-out:
+- 	return true;
+-}
+-#endif
+-
+ const struct in_addr ip_none = { .s_addr = 0 };
+ 
+ /*

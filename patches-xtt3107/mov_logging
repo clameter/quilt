@@ -2,10 +2,10 @@ Index: rdma-core/ib2roce/CMakeLists.txt-NO_MSTFLINT
 ===================================================================
 --- rdma-core.orig/ib2roce/CMakeLists.txt-NO_MSTFLINT
 +++ rdma-core/ib2roce/CMakeLists.txt-NO_MSTFLINT
-@@ -10,6 +10,7 @@ rdma_executable(ib2roce
+@@ -8,6 +8,7 @@ rdma_executable(ib2roce
+   errno.c
+   ring.c
    sched.c
-   buffers.c
-   locking.c
 +  logging.c
  )
  target_link_libraries(ib2roce LINK_PRIVATE
@@ -14,7 +14,7 @@ Index: rdma-core/ib2roce/logging.c
 ===================================================================
 --- /dev/null
 +++ rdma-core/ib2roce/logging.c
-@@ -0,0 +1,104 @@
+@@ -0,0 +1,105 @@
 +/*
 + * Logging support to syslog or console
 + *
@@ -63,6 +63,7 @@ Index: rdma-core/ib2roce/logging.c
 +#include <sys/types.h>
 +#include <sys/stat.h>
 +#include <syslog.h>
++#include <execinfo.h>
 +#include "sched.h"
 +#include "ring.h"
 +#include "logging.h"
@@ -97,7 +98,7 @@ Index: rdma-core/ib2roce/logging.c
 +
 +#define NR_FRAMES 100
 +__attribute__ ((format (printf, 1, 2)))
-+static void panic(const char *fmt, ...)
++void panic(const char *fmt, ...)
 +{
 +	va_list valist;
 +	void *frames[NR_FRAMES];
@@ -108,7 +109,7 @@ Index: rdma-core/ib2roce/logging.c
 +	printf("IB2ROCE Panic: ");
 +	va_start(valist, fmt);
 +	vprintf(fmt, valist);
-+	
++
 +	nrframes = backtrace(frames, NR_FRAMES);
 +	strings = backtrace_symbols(frames, nrframes);
 +
@@ -123,7 +124,7 @@ Index: rdma-core/ib2roce/logging.h
 ===================================================================
 --- /dev/null
 +++ rdma-core/ib2roce/logging.h
-@@ -0,0 +1,54 @@
+@@ -0,0 +1,50 @@
 +/*
 + * Logging interface
 + *
@@ -166,15 +167,11 @@ Index: rdma-core/ib2roce/logging.h
 +#include <stdio.h>
 +#include <stdlib.h>
 +#include <stdarg.h>
-+#include <signal.h>
-+#include <sys/types.h>
-+#include <sys/stat.h>
-+#include <syslog.h>
 +
 +__attribute__ ((format (printf, 2, 3)))
 +void logg(int prio, const char *fmt, ...);
 +
 +__attribute__ ((format (printf, 1, 2)))
-+static void panic(const char *fmt, ...);
++void panic(const char *fmt, ...);
 +
 +

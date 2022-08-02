@@ -1,0 +1,1181 @@
+Index: rdma-core/ib2roce/multicast.c
+===================================================================
+--- /dev/null
++++ rdma-core/ib2roce/multicast.c
+@@ -0,0 +1,487 @@
++/*
++ * RDMA / Socket Multicast Support
++ *
++ * (C) 2021-2022 Christoph Lameter <cl@linux.com>
++ *
++ * This software is available to you under a choice of one of two
++ * licenses.  You may choose to be licensed under the terms of the GNU
++ * General Public License (GPL) Version 2, available from the file
++ * COPYING in the main directory of this source tree, or the
++ * OpenIB.org BSD license below:
++ *
++ *     Redistribution and use in source and binary forms, with or
++ *     without modification, are permitted provided that the following
++ *     conditions are met:
++ *
++ *      - Redistributions of source code must retain the above
++ *        copyright notice, this list of conditions and the following
++ *        disclaimer.
++ *
++ *      - Redistributions in binary form must reproduce the above
++ *        copyright notice, this list of conditions and the following
++ *        disclaimer in the documentation and/or other materials
++ *        provided with the distribution.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++ * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
++ * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
++ * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
++ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ *
++ * $Author: Christoph Lameter [cl@linux.com]$
++ *
++ */
++
++#define _GNU_SOURCE
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <stdbool.h>
++#include <stdarg.h>
++#include <unistd.h>
++#include <signal.h>
++#include <sys/types.h>
++#include <sys/stat.h>
++#include <syslog.h>
++#include <fcntl.h>
++#include <ctype.h>
++#include <pthread.h>
++#include <numa.h>
++#include <stdatomic.h>
++#include <arpa/inet.h>
++#include <sys/socket.h>
++#include <netdb.h>
++#include <getopt.h>
++#include <sys/ioctl.h>
++#include <rdma/rdma_cma.h>
++#include <infiniband/ib.h>
++#include <infiniband/verbs.h>
++#include <poll.h>
++#include <sys/mman.h>
++
++#include <linux/rtnetlink.h>
++#include <net/ethernet.h>
++#include <linux/ip.h>
++#include <linux/udp.h>
++#include <linux/if_arp.h>
++#include <linux/if_packet.h>
++#include <infiniband/mad.h>
++#include <infiniband/umad_cm.h>
++#include <infiniband/umad_str.h>
++#include <execinfo.h>
++#include "packet.h"
++#include "errno.h"
++#include "bth_hdr.h"
++#include "ib_hdrs.h"
++#include "fifo.h"
++#include "ring.h"
++#include "hash.h"
++#include "sched.h"
++#include "logging.h"
++#include "locking.h"
++#include "buffers.h"
++#include "multicast.h"
++
++/*
++ * Multicast Handling (follows the limit per QP as stated in device_attr for ConnectX6)
++ */
++unsigned nr_mc;
++unsigned active_mc;	/* MC groups actively briding */
++
++const char *mc_text[NR_MC_STATUS] = { "Inactive", "Joining", "Joined", "Error" };
++
++struct mc mcs[MAX_MC];
++
++struct hash *mc_hash;
++
++struct mc *hash_lookup_mc(struct in_addr addr)
++{
++	unsigned a = ntohl(addr.s_addr) | 0xe0000000; /* Infiniband may strip top 4 bits so provide them */
++	struct in_addr x = {
++		.s_addr = htonl(a)
++	};
++
++	return hash_find(mc_hash, &x);
++}
++
++int hash_add_mc(struct mc *m)
++{
++	lock();
++
++	if (hash_find(mc_hash, &m->addr)) {
++		unlock();
++		return -EEXIST;
++	}
++
++	hash_add(mc_hash, m);
++
++	unlock();
++	return 0;
++}
++
++/*
++ * Handling of special Multicast Group MGID encodings on Infiniband
++ */
++#define nr_mgid_signatures 5
++
++static struct mgid_signature {		/* Manage different MGID formats used */
++	unsigned short signature;
++	const char *id;
++	bool port;		/* Port field is used in MGID */
++	bool full_ipv4;		/* Full IP address */
++	bool pkey;		/* Pkey in MGID */
++} mgid_signatures[nr_mgid_signatures] = {
++	{	0x0000, "RDMA", false, false, true },
++	{	0x401B,	"IPv4",	false, false, true },
++	{	0x601B,	"IPv6",	false, false, true },
++	{	0xA01B,	"CLLM", true, true, false },
++	{	0x4001, "IB",	false, false, false }
++};
++
++static struct mgid_signature *mgid_mode = mgid_signatures + 3;		/* CLLM is the default */
++
++
++static struct mgid_signature *__find_mgid_mode(char *p)
++{
++	struct mgid_signature *g;
++
++	for(g = mgid_signatures; g < mgid_signatures + nr_mgid_signatures; g++)
++		if (strcasecmp(p, g->id) == 0)
++			return g;
++
++	return NULL;
++}
++
++bool find_mgid_mode(char *p)
++{
++	struct mgid_signature *g = __find_mgid_mode(p);
++
++	if (!g) {
++		fprintf(stderr, "Not a valid mgid mode %s\n", p);
++		return false;
++	}
++	mgid_mode = g;
++	return true;
++}
++
++/* Setup the addreses for ROCE and INFINIBAND based on a ipaddr:port spec */
++void setup_mc_addrs(struct mc *m, struct sockaddr_in *si)
++{
++	m->interface[ROCE].sa = (struct sockaddr  *)si;
++	m->port = ntohs(si->sin_port);
++	m->interface[INFINIBAND].sa = m->interface[ROCE].sa;
++
++	if (m->mgid_mode->signature) {
++		/*
++		 * MGID is build according to according to RFC 4391 Section 4
++		 * by taking 28 bits and putting them into the mgid
++		 *
++		 * But then CLLM and others include the full 32 bit...
++		 * Deal with this crappy situation.
++		 */
++		struct sockaddr_ib *saib	= calloc(1, sizeof(struct sockaddr_ib));
++		unsigned short *mgid_header	= (unsigned short *)saib->sib_addr.sib_raw;
++		unsigned short *mgid_signature	= (unsigned short *)(saib->sib_addr.sib_raw + 2);
++		unsigned short *mgid_pkey	= (unsigned short *)(saib->sib_addr.sib_raw + 4);
++		unsigned short *mgid_port	= (unsigned short *)(saib->sib_addr.sib_raw + 10);
++		unsigned int *mgid_ipv4		= (unsigned int *)(saib->sib_addr.sib_raw + 12);
++		unsigned int multicast = ntohl(m->addr.s_addr);
++		struct mgid_signature *mg = m->mgid_mode;
++
++		saib->sib_family = AF_IB,
++		saib->sib_sid = si->sin_port;
++
++		*mgid_header = htons(0xff15);
++		*mgid_signature = htons(mg->signature);
++
++		if (mg->pkey)
++			/* WTF? Where do we get the pkey from ? */
++			*mgid_pkey = 0xFFFF;
++
++		if (mg->port)
++			*mgid_port = si->sin_port;
++
++		if (!mg->full_ipv4)
++			/* Strip to 28 bits according to RFC */
++			multicast &= 0x0fffffff;
++
++		*mgid_ipv4 = htonl(multicast);
++
++		m->interface[INFINIBAND].sa = (struct sockaddr *)saib;
++	}
++}
++
++/*
++ * Parse an address with port number [:xxx] and/or mgid format [/YYYY]
++ */
++struct sockaddr_in *parse_addr(const char *arg, int port,
++	struct mgid_signature **p_mgid_mode, uint8_t *p_tos_mode, bool mc_only)
++{
++	struct addrinfo *res;
++	char *service;
++	const struct addrinfo hints = {
++		.ai_family = AF_INET,
++		.ai_socktype = SOCK_DGRAM,
++		.ai_protocol = IPPROTO_UDP
++	};
++	struct sockaddr_in *si;
++	char *p, *q;
++	int ret;
++	struct mgid_signature *mgid;
++	struct in_addr addr;
++	uint8_t tos;
++	char *a = strdupa(arg);
++
++	service = strchr(a, ':');
++
++	if (service) {
++
++		*service++ = 0;
++		p = service;
++
++	} else {
++		char *s = alloca(10);
++
++		snprintf(s, 10, "%d", port);
++		service = s;
++		p = a;
++	}
++
++	q = strchr(p, '/');
++	if (q) {
++		*q++ = 0;
++		mgid = __find_mgid_mode(q);
++
++		if (!mgid) {
++			fprintf(stderr, "MGID mode not found %s\n", p);
++			return NULL;
++		}
++		p = q;
++	} else
++		mgid = mgid_mode;
++
++	q = strchr(p, '#');
++	if (q) {
++		*q++ = 0;
++		tos = atoi(q);
++		if (!tos) {
++			fprintf(stderr, "TOS value invalid : %p\n", p);
++			return NULL;
++		}
++	} else
++		tos = tos_mode;
++
++	ret = getaddrinfo(a, service, &hints, &res);
++	if (ret) {
++		fprintf(stderr, "getaddrinfo() failed (%s) - invalid IP address.\n", gai_strerror(ret));
++		return NULL;
++	}
++
++	si = malloc(sizeof(struct sockaddr_in));
++	memcpy(si, res->ai_addr, sizeof(struct sockaddr_in));
++	freeaddrinfo(res);
++
++	addr = si->sin_addr;
++	if (mc_only && !IN_MULTICAST(ntohl(addr.s_addr))) {
++		fprintf(stderr, "Not a multicast address (%s)\n", arg);
++		return NULL;
++	}
++
++	*p_mgid_mode = mgid;
++	*p_tos_mode = tos;
++	return si;
++}
++
++const char * mgid_text(struct mc *m)
++{
++	if (m) 
++		return m->mgid_mode->id;
++	else
++		return mgid_mode->id;
++}
++
++void mgids_out(void)
++{
++	int n;
++
++	printf("List of supported MGID formats via -l<id>\n");
++	printf("=================================\n");
++	printf(" ID    | Signature | Port in MGID\n");
++	printf("-------+-----------+-------------\n");
++	for (n = 0; n < nr_mgid_signatures; n++) {
++		struct mgid_signature *m = mgid_signatures + n;
++
++			printf("%7s|    0x%04x | %s\n",
++					m->id, m->signature, m->port ? "true" : "false");
++	}
++}
++
++bool mgid_check(struct mc *m, unsigned short signature)
++{
++	if (m->mgid_mode->signature) {
++		if (signature != m->mgid_mode->signature)
++			return false;
++	}
++	return true;
++}
++
++/* Multicast group specifications on the command line */
++int new_mc_addr(char *arg,
++	bool sendonly_infiniband,
++	bool sendonly_roce)
++{
++	struct sockaddr_in *si;
++	struct mc *m = mcs + nr_mc;
++	int ret;
++
++	if (nr_mc == MAX_MC) {
++		fprintf(stderr, "Too many multicast groups\n");
++		return 1;
++	}
++
++	m->interface[INFINIBAND].sendonly = sendonly_infiniband;
++	m->interface[ROCE].sendonly = sendonly_roce;
++	m->text = strdup(arg);
++
++	si = parse_addr(arg, default_mc_port, &m->mgid_mode, &m->tos_mode, true);
++	if (!si)
++		return 1;
++
++	m->addr = si->sin_addr;
++	ret = hash_add_mc(m);
++	if (ret) {
++		fprintf(stderr, "Duplicate multicast address (%s)\n", arg);
++		goto out;
++	}
++
++	setup_mc_addrs(m, si);
++	nr_mc++;
++	ret = 0;
++
++out:
++	return ret;
++}
++
++int _join_mc(struct in_addr addr, struct sockaddr *sa,
++	unsigned port, uint8_t tos, enum interfaces i, bool sendonly, void *private)
++{
++	struct rdma_cm_join_mc_attr_ex mc_attr = {
++		.comp_mask = RDMA_CM_JOIN_MC_ATTR_ADDRESS | RDMA_CM_JOIN_MC_ATTR_JOIN_FLAGS,
++		.join_flags = sendonly ? RDMA_MC_JOIN_FLAG_SENDONLY_FULLMEMBER
++                                       : RDMA_MC_JOIN_FLAG_FULLMEMBER,
++		.addr = sa
++	};
++	int ret;
++
++	ret = rdma_join_multicast_ex(id(i), &mc_attr, private);
++
++	if (ret) {
++		logg(LOG_CRIT, "Failed to create join request %s:%d on %s. Error %s\n",
++			inet_ntoa(addr), port,
++			interfaces_text[i],
++			errname());
++		return 1;
++	}
++	logg(LOG_NOTICE, "Join Request %sMC group %s:%d on %s.\n",
++		sendonly ? "Sendonly " : "",
++		inet_ntoa(addr), port,
++		interfaces_text[i]);
++	st(i2r[i].multicast, join_requests);
++	return 0;
++}
++
++int _leave_mc(struct in_addr addr,struct sockaddr *si, enum interfaces i)
++{
++	int ret;
++
++	ret = rdma_leave_multicast(id(i), si);
++	if (ret) {
++		logg(LOG_ERR, "Failure on rdma_leave_multicast on %s:%s\n", interfaces_text[i], inet_ntoa(addr));
++		return 1;
++	}
++	logg(LOG_NOTICE, "Leaving MC group %s on %s .\n",
++		inet_ntoa(addr),
++		interfaces_text[i]);
++	st(i2r[i].multicast, leave_requests);
++	return 0;
++}
++
++int leave_mc(enum interfaces i)
++{
++	int j;
++	int ret;
++
++	for (j = 0; j < nr_mc; j++) {
++		struct mc *m = mcs + j;
++
++		ret = _leave_mc(m->addr, m->interface[i].sa, i);
++		if (ret)
++			return 1;
++	}
++	return 0;
++}
++
++/*
++ * Join MC groups. This is called from the event loop every second
++ * as long as there are unjoined groups
++ */
++void join_processing(void)
++{
++	int i;
++	enum interfaces in;
++	int mcs_per_call = 0;
++
++	for (i = 0; i < nr_mc; i++) {
++		struct mc *m = mcs + i;
++		unsigned port = m->port;
++
++		if (m->interface[ROCE].status == MC_JOINED && m->interface[INFINIBAND].status == MC_JOINED)
++			continue;
++
++		for(in = 0; in < 2; in++) {
++			struct mc_interface *mi = m->interface + in;
++			uint8_t tos = i == ROCE ? m->tos_mode : 0;
++
++			if (i2r[in].context) {
++				switch(mi->status) {
++
++				case MC_OFF:
++					if (_join_mc(m->addr, mi->sa, port, tos, in, mi->sendonly, m) == 0)
++						m->interface[in].status = MC_JOINING;
++					break;
++
++				case MC_ERROR:
++
++					_leave_mc(m->addr, mi->sa, in);
++					mi->status = MC_OFF;
++					logg(LOG_WARNING, "Left Multicast group %s on %s due to MC_ERROR\n",
++						m->text, interfaces_text[in]);
++					break;
++
++				case MC_JOINED:
++					break;
++
++				default:
++					logg(LOG_ERR, "Bad MC status %d MC %s on %s\n",
++					       mi->status, m->text, interfaces_text[in]);
++					break;
++				}
++			}
++		}
++
++		mcs_per_call++;
++
++		if (mcs_per_call > 10)
++			break;
++
++	}
++}
++
++void multicast_init(void) {
++	mc_hash = hash_create(offsetof(struct mc, addr), sizeof(struct in_addr));
++}
++
++	
+Index: rdma-core/ib2roce/multicast.h
+===================================================================
+--- /dev/null
++++ rdma-core/ib2roce/multicast.h
+@@ -0,0 +1,165 @@
++#ifndef IB2ROCE_MULTICAST
++#define IB2ROCE_MULTICAST
++/*
++ * RDMA / Socket Multicast Support
++ *
++ * (C) 2021-2022 Christoph Lameter <cl@linux.com>
++ *
++ * This software is available to you under a choice of one of two
++ * licenses.  You may choose to be licensed under the terms of the GNU
++ * General Public License (GPL) Version 2, available from the file
++ * COPYING in the main directory of this source tree, or the
++ * OpenIB.org BSD license below:
++ *
++ *     Redistribution and use in source and binary forms, with or
++ *     without modification, are permitted provided that the following
++ *     conditions are met:
++ *
++ *      - Redistributions of source code must retain the above
++ *        copyright notice, this list of conditions and the following
++ *        disclaimer.
++ *
++ *      - Redistributions in binary form must reproduce the above
++ *        copyright notice, this list of conditions and the following
++ *        disclaimer in the documentation and/or other materials
++ *        provided with the distribution.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++ * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
++ * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
++ * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
++ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ *
++ * $Author: Christoph Lameter [cl@linux.com]$
++ *
++ */
++
++#define _GNU_SOURCE
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <stdbool.h>
++#include <stdarg.h>
++#include <unistd.h>
++#include <signal.h>
++#include <sys/types.h>
++#include <sys/stat.h>
++#include <syslog.h>
++#include <fcntl.h>
++#include <ctype.h>
++#include <pthread.h>
++#include <numa.h>
++#include <stdatomic.h>
++#include <arpa/inet.h>
++#include <sys/socket.h>
++#include <netdb.h>
++#include <getopt.h>
++#include <sys/ioctl.h>
++#include <rdma/rdma_cma.h>
++#include <infiniband/ib.h>
++#include <infiniband/verbs.h>
++#include <poll.h>
++#include <sys/mman.h>
++
++#include <linux/rtnetlink.h>
++#include <net/ethernet.h>
++#include <linux/ip.h>
++#include <linux/udp.h>
++#include <linux/if_arp.h>
++#include <linux/if_packet.h>
++#include <infiniband/mad.h>
++#include <infiniband/umad_cm.h>
++#include <infiniband/umad_str.h>
++#include "errno.h"
++#include "ib_hdrs.h"
++#include "fifo.h"
++#include "ring.h"
++#include "hash.h"
++#include "sched.h"
++#include "logging.h"
++#include "locking.h"
++#include "buffers.h"
++
++
++#define MAX_MC 240
++
++extern unsigned nr_mc;
++
++extern unsigned active_mc;	/* MC groups actively briding */
++
++enum mc_status { MC_OFF, MC_JOINING, MC_JOINED, MC_ERROR, NR_MC_STATUS };
++
++extern const char *mc_text[NR_MC_STATUS];
++
++/* A multicast group.
++ *
++ * ah_info points to multicast address and QP number in use
++ * for the stream. There are no "ports" unless they are
++ * embedded in the GID (like done by CLLM).
++ *
++ * Multicast groups are setup before we enter multithreaded mode
++ * However, the state of joins etc may change in multithreaded
++ * mode. Access to that status information requires some care.
++ */
++struct mc_interface {
++	enum mc_status status;
++	bool sendonly;
++	struct ah_info ai;
++	struct sockaddr *sa;
++	uint32_t packet_time;		/* How much time must elapse for a packet to be sent 0 = disabled */
++	uint32_t max_burst;		/* How long can a burst last */
++	uint64_t last_sent;		/* Last time a packet was sent */
++	uint64_t last_delayed;		/* Last a delayed packet was scheduled */
++	unsigned pending;		/* How many packets are waiting to be sent */
++	unsigned burst;			/* # of packets encountered with pacing below packet_time */
++	unsigned long delayed;		/* Packets delayed */
++};
++
++struct mc {
++	struct in_addr addr;
++	struct mc_interface interface[2];
++	void (*callback)(struct mc *, enum interfaces, struct buf *);
++	uint8_t tos_mode;
++	uint16_t port;
++	struct mgid_signature *mgid_mode;
++	const char *text;
++};
++
++extern struct mc mcs[MAX_MC];
++
++int hash_add_mc(struct mc *m);
++struct mc *hash_lookup_mc(struct in_addr addr);
++
++/* Setup the addreses for ROCE and INFINIBAND based on a ipaddr:port spec */
++void setup_mc_addrs(struct mc *m, struct sockaddr_in *si);
++/* Multicast group specifications on the command line */
++int new_mc_addr(char *arg,
++	bool sendonly_infiniband,
++	bool sendonly_roce);
++
++int _join_mc(struct in_addr addr, struct sockaddr *sa,
++	unsigned port, uint8_t tos, enum interfaces i, bool sendonly, void *private);
++int _leave_mc(struct in_addr addr,struct sockaddr *si, enum interfaces i);
++
++int leave_mc(enum interfaces i);
++
++void join_processing(void);
++
++/* MGID format processing */
++bool find_mgid_mode(char *p);
++
++struct sockaddr_in *parse_addr(const char *arg, int port,
++	struct mgid_signature **p_mgid_mode, uint8_t *p_tos_mode, bool mc_only);
++
++const char *mgid_text(struct mc *m);
++
++void mgids_out(void);
++
++bool mgid_check(struct mc *m, unsigned short signature);
++
++void multicast_init(void);
++
++#endif
+Index: rdma-core/ib2roce/ib2roce.c
+===================================================================
+--- rdma-core.orig/ib2roce/ib2roce.c
++++ rdma-core/ib2roce/ib2roce.c
+@@ -83,6 +83,7 @@
+ #include "logging.h"
+ #include "locking.h"
+ #include "buffers.h"
++#include "multicast.h"
+ 
+ #include "ibraw.h"
+ #include "cma-hdr.h"
+@@ -137,27 +138,6 @@ static const char *inet6_ntoa(void *x)
+ 
+ const struct in_addr ip_none = { .s_addr = 0 };
+ 
+-/*
+- * Handling of special Multicast Group MGID encodings on Infiniband
+- */
+-#define nr_mgid_signatures 5
+-
+-struct mgid_signature {		/* Manage different MGID formats used */
+-	unsigned short signature;
+-	const char *id;
+-	bool port;		/* Port field is used in MGID */
+-	bool full_ipv4;		/* Full IP address */
+-	bool pkey;		/* Pkey in MGID */
+-} mgid_signatures[nr_mgid_signatures] = {
+-	{	0x0000, "RDMA", false, false, true },
+-	{	0x401B,	"IPv4",	false, false, true },
+-	{	0x601B,	"IPv6",	false, false, true },
+-	{	0xA01B,	"CLLM", true, true, false },
+-	{	0x4001, "IB",	false, false, false }
+-};
+-
+-struct mgid_signature *mgid_mode = mgid_signatures + 3;		/* CLLM is the default */
+-
+ uint8_t tos_mode = 0;
+ 
+ /*
+@@ -454,315 +434,6 @@ static int find_rdma_devices(void)
+ /*
+  * Multicast Handling (follows the limit per QP as stated in device_attr for ConnectX6)
+  */
+-#define MAX_MC 240
+-
+-static unsigned nr_mc;
+-static unsigned active_mc;	/* MC groups actively briding */
+-
+-enum mc_status { MC_OFF, MC_JOINING, MC_JOINED, MC_ERROR, NR_MC_STATUS };
+-
+-const char *mc_text[NR_MC_STATUS] = { "Inactive", "Joining", "Joined", "Error" };
+-
+-/* A multicast group.
+- *
+- * ah_info points to multicast address and QP number in use
+- * for the stream. There are no "ports" unless they are
+- * embedded in the GID (like done by CLLM).
+- *
+- * Multicast groups are setup before we enter multithreaded mode
+- * However, the state of joins etc may change in multithreaded
+- * mode. Access to that status information requires some care.
+- */
+-struct mc_interface {
+-	enum mc_status status;
+-	bool sendonly;
+-	struct ah_info ai;
+-	struct sockaddr *sa;
+-	uint32_t packet_time;		/* How much time must elapse for a packet to be sent 0 = disabled */
+-	uint32_t max_burst;		/* How long can a burst last */
+-	uint64_t last_sent;		/* Last time a packet was sent */
+-	uint64_t last_delayed;		/* Last a delayed packet was scheduled */
+-	unsigned pending;		/* How many packets are waiting to be sent */
+-	unsigned burst;			/* # of packets encountered with pacing below packet_time */
+-	unsigned long delayed;		/* Packets delayed */
+-};
+-
+-static struct mc {
+-	struct in_addr addr;
+-	struct mc_interface interface[2];
+-	void (*callback)(struct mc *, enum interfaces, struct buf *);
+-	uint8_t tos_mode;
+-	uint16_t port;
+-	struct mgid_signature *mgid_mode;
+-	const char *text;
+-} mcs[MAX_MC];
+-
+-struct hash *mc_hash;
+-
+-static struct mc *hash_lookup_mc(struct in_addr addr)
+-{
+-	unsigned a = ntohl(addr.s_addr) | 0xe0000000; /* Infiniband may strip top 4 bits so provide them */
+-	struct in_addr x = {
+-		.s_addr = htonl(a)
+-	};
+-
+-	return hash_find(mc_hash, &x);
+-}
+-
+-static int hash_add_mc(struct mc *m)
+-{
+-	lock();
+-
+-	if (hash_find(mc_hash, &m->addr)) {
+-		unlock();
+-		return -EEXIST;
+-	}
+-
+-	hash_add(mc_hash, m);
+-
+-	unlock();
+-	return 0;
+-}
+-
+-static struct mgid_signature *find_mgid_mode(char *p)
+-{
+-	struct mgid_signature *g;
+-
+-	for(g = mgid_signatures; g < mgid_signatures + nr_mgid_signatures; g++)
+-		if (strcasecmp(p, g->id) == 0)
+-			break;
+-
+-	if (g >= mgid_signatures + nr_mgid_signatures) {
+-		fprintf(stderr, "Not a valid mgid mode %s\n", p);
+-		return NULL;
+-	}
+-	return g;
+-}
+-
+-/*
+- * Parse an address with port number [:xxx] and/or mgid format [/YYYY]
+- */
+-static struct sockaddr_in *parse_addr(const char *arg, int port,
+-	struct mgid_signature **p_mgid_mode, uint8_t *p_tos_mode, bool mc_only)
+-{
+-	struct addrinfo *res;
+-	char *service;
+-	const struct addrinfo hints = {
+-		.ai_family = AF_INET,
+-		.ai_socktype = SOCK_DGRAM,
+-		.ai_protocol = IPPROTO_UDP
+-	};
+-	struct sockaddr_in *si;
+-	char *p, *q;
+-	int ret;
+-	struct mgid_signature *mgid;
+-	struct in_addr addr;
+-	uint8_t tos;
+-	char *a = strdupa(arg);
+-
+-	service = strchr(a, ':');
+-
+-	if (service) {
+-
+-		*service++ = 0;
+-		p = service;
+-
+-	} else {
+-		char *s = alloca(10);
+-
+-		snprintf(s, 10, "%d", port);
+-		service = s;
+-		p = a;
+-	}
+-
+-	q = strchr(p, '/');
+-	if (q) {
+-		*q++ = 0;
+-		mgid = find_mgid_mode(q);
+-
+-		if (!mgid) {
+-			fprintf(stderr, "MGID mode not found %s\n", p);
+-			return NULL;
+-		}
+-		p = q;
+-	} else
+-		mgid = mgid_mode;
+-
+-	q = strchr(p, '#');
+-	if (q) {
+-		*q++ = 0;
+-		tos = atoi(q);
+-		if (!tos) {
+-			fprintf(stderr, "TOS value invalid : %p\n", p);
+-			return NULL;
+-		}
+-	} else
+-		tos = tos_mode;
+-
+-	ret = getaddrinfo(a, service, &hints, &res);
+-	if (ret) {
+-		fprintf(stderr, "getaddrinfo() failed (%s) - invalid IP address.\n", gai_strerror(ret));
+-		return NULL;
+-	}
+-
+-	si = malloc(sizeof(struct sockaddr_in));
+-	memcpy(si, res->ai_addr, sizeof(struct sockaddr_in));
+-	freeaddrinfo(res);
+-
+-	addr = si->sin_addr;
+-	if (mc_only && !IN_MULTICAST(ntohl(addr.s_addr))) {
+-		fprintf(stderr, "Not a multicast address (%s)\n", arg);
+-		return NULL;
+-	}
+-
+-	*p_mgid_mode = mgid;
+-	*p_tos_mode = tos;
+-	return si;
+-}
+-
+-/* Setup the addreses for ROCE and INFINIBAND based on a ipaddr:port spec */
+-static void setup_mc_addrs(struct mc *m, struct sockaddr_in *si)
+-{
+-	m->interface[ROCE].sa = (struct sockaddr  *)si;
+-	m->port = ntohs(si->sin_port);
+-	m->interface[INFINIBAND].sa = m->interface[ROCE].sa;
+-
+-	if (m->mgid_mode->signature) {
+-		/*
+-		 * MGID is build according to according to RFC 4391 Section 4
+-		 * by taking 28 bits and putting them into the mgid
+-		 *
+-		 * But then CLLM and others include the full 32 bit...
+-		 * Deal with this crappy situation.
+-		 */
+-		struct sockaddr_ib *saib	= calloc(1, sizeof(struct sockaddr_ib));
+-		unsigned short *mgid_header	= (unsigned short *)saib->sib_addr.sib_raw;
+-		unsigned short *mgid_signature	= (unsigned short *)(saib->sib_addr.sib_raw + 2);
+-		unsigned short *mgid_pkey	= (unsigned short *)(saib->sib_addr.sib_raw + 4);
+-		unsigned short *mgid_port	= (unsigned short *)(saib->sib_addr.sib_raw + 10);
+-		unsigned int *mgid_ipv4		= (unsigned int *)(saib->sib_addr.sib_raw + 12);
+-		unsigned int multicast = ntohl(m->addr.s_addr);
+-		struct mgid_signature *mg = m->mgid_mode;
+-
+-		saib->sib_family = AF_IB,
+-		saib->sib_sid = si->sin_port;
+-
+-		*mgid_header = htons(0xff15);
+-		*mgid_signature = htons(mg->signature);
+-
+-		if (mg->pkey)
+-			/* WTF? Where do we get the pkey from ? */
+-			*mgid_pkey = 0xFFFF;
+-
+-		if (mg->port)
+-			*mgid_port = si->sin_port;
+-
+-		if (!mg->full_ipv4)
+-			/* Strip to 28 bits according to RFC */
+-			multicast &= 0x0fffffff;
+-
+-		*mgid_ipv4 = htonl(multicast);
+-
+-		m->interface[INFINIBAND].sa = (struct sockaddr *)saib;
+-	}
+-}
+-
+-/* Multicast group specifications on the command line */
+-static int new_mc_addr(char *arg,
+-	bool sendonly_infiniband,
+-	bool sendonly_roce)
+-{
+-	struct sockaddr_in *si;
+-	struct mc *m = mcs + nr_mc;
+-	int ret;
+-
+-	if (nr_mc == MAX_MC) {
+-		fprintf(stderr, "Too many multicast groups\n");
+-		return 1;
+-	}
+-
+-	m->interface[INFINIBAND].sendonly = sendonly_infiniband;
+-	m->interface[ROCE].sendonly = sendonly_roce;
+-	m->text = strdup(arg);
+-
+-	si = parse_addr(arg, default_mc_port, &m->mgid_mode, &m->tos_mode, true);
+-	if (!si)
+-		return 1;
+-
+-	m->addr = si->sin_addr;
+-	ret = hash_add_mc(m);
+-	if (ret) {
+-		fprintf(stderr, "Duplicate multicast address (%s)\n", arg);
+-		goto out;
+-	}
+-
+-	setup_mc_addrs(m, si);
+-	nr_mc++;
+-	ret = 0;
+-
+-out:
+-	return ret;
+-}
+-
+-static int _join_mc(struct in_addr addr, struct sockaddr *sa,
+-	unsigned port, uint8_t tos, enum interfaces i, bool sendonly, void *private)
+-{
+-	struct rdma_cm_join_mc_attr_ex mc_attr = {
+-		.comp_mask = RDMA_CM_JOIN_MC_ATTR_ADDRESS | RDMA_CM_JOIN_MC_ATTR_JOIN_FLAGS,
+-		.join_flags = sendonly ? RDMA_MC_JOIN_FLAG_SENDONLY_FULLMEMBER
+-                                       : RDMA_MC_JOIN_FLAG_FULLMEMBER,
+-		.addr = sa
+-	};
+-	int ret;
+-	
+-	ret = rdma_join_multicast_ex(id(i), &mc_attr, private);
+-
+-	if (ret) {
+-		logg(LOG_CRIT, "Failed to create join request %s:%d on %s. Error %s\n",
+-			inet_ntoa(addr), port,
+-			interfaces_text[i],
+-			errname());
+-		return 1;
+-	}
+-	logg(LOG_NOTICE, "Join Request %sMC group %s:%d on %s.\n",
+-		sendonly ? "Sendonly " : "",
+-		inet_ntoa(addr), port,
+-		interfaces_text[i]);
+-	st(i2r[i].multicast, join_requests);
+-	return 0;
+-}
+-
+-static int _leave_mc(struct in_addr addr,struct sockaddr *si, enum interfaces i)
+-{
+-	int ret;
+-
+-	ret = rdma_leave_multicast(id(i), si);
+-	if (ret) {
+-		logg(LOG_ERR, "Failure on rdma_leave_multicast on %s:%s\n", interfaces_text[i], inet_ntoa(addr));
+-		return 1;
+-	}
+-	logg(LOG_NOTICE, "Leaving MC group %s on %s .\n",
+-		inet_ntoa(addr),
+-		interfaces_text[i]);
+-	st(i2r[i].multicast, leave_requests);
+-	return 0;
+-}
+-
+-static int leave_mc(enum interfaces i)
+-{
+-	int j;
+-	int ret;
+-
+-	for (j = 0; j < nr_mc; j++) {
+-		struct mc *m = mcs + j;
+-
+-		ret = _leave_mc(m->addr, m->interface[i].sa, i);
+-		if (ret)
+-			return 1;
+-	}
+-	return 0;
+-}
+-
+ static void beacon_received(struct mc *, enum interfaces, struct buf *buf);
+ 
+ #ifdef UNICAST
+@@ -1863,62 +1534,6 @@ static void shutdown_roce(void)
+ 	qp_destroy(i2r + ROCE);
+ }
+ 
+-/*
+- * Join MC groups. This is called from the event loop every second
+- * as long as there are unjoined groups
+- */
+-static void join_processing(void)
+-{
+-	int i;
+-	enum interfaces in;
+-	int mcs_per_call = 0;
+-
+-	for (i = 0; i < nr_mc; i++) {
+-		struct mc *m = mcs + i;
+-		unsigned port = m->port;
+-
+-		if (m->interface[ROCE].status == MC_JOINED && m->interface[INFINIBAND].status == MC_JOINED)
+-			continue;
+-
+-		for(in = 0; in < 2; in++) {
+-			struct mc_interface *mi = m->interface + in;
+-			uint8_t tos = i == ROCE ? m->tos_mode : 0;
+-
+-			if (i2r[in].context) {
+-				switch(mi->status) {
+-
+-				case MC_OFF:
+-					if (_join_mc(m->addr, mi->sa, port, tos, in, mi->sendonly, m) == 0)
+-						m->interface[in].status = MC_JOINING;
+-					break;
+-
+-				case MC_ERROR:
+-
+-					_leave_mc(m->addr, mi->sa, in);
+-					mi->status = MC_OFF;
+-					logg(LOG_WARNING, "Left Multicast group %s on %s due to MC_ERROR\n",
+-						m->text, interfaces_text[in]);
+-					break;
+-
+-				case MC_JOINED:
+-					break;
+-
+-				default:
+-					logg(LOG_ERR, "Bad MC status %d MC %s on %s\n",
+-					       mi->status, m->text, interfaces_text[in]);
+-					break;
+-				}
+-			}
+-		}
+-
+-		mcs_per_call++;
+-
+-		if (mcs_per_call > 10)
+-			break;
+-
+-	}
+-}
+-
+ #ifdef UNICAST
+ static void resolve_start(struct rdma_unicast *);
+ 
+@@ -3300,15 +2915,10 @@ static void receive_multicast(struct buf
+ 		unsigned char *mgid = buf->grh.dgid.raw;
+ 		unsigned short signature = ntohs(*(unsigned short*)(mgid + 2));
+ 
+-		if (m->mgid_mode->signature) {
+-			if (signature == m->mgid_mode->signature) {
+-//				if (m->mgid_mode->port)
+-//					port = ntohs(*((unsigned short *)(mgid + 10)));
+-			} else {
+-				logg(LOG_INFO, "Discard Packet: MGID multicast signature(%x)  mismatch. MGID=%s\n",
+-						signature, inet6_ntoa(mgid));
+-				goto invalid_packet;
+-			}
++		if (!mgid_check(m, signature)) {
++			logg(LOG_INFO, "Discard Packet: MGID multicast signature(%x)  mismatch. MGID=%s\n",
++					signature, inet6_ntoa(mgid));
++			goto invalid_packet;
+ 		}
+ 
+ 	}
+@@ -4432,7 +4042,7 @@ static unsigned show_multicast(char *b)
+ 			inet_ntoa(m->addr),
+ 			mc_text[m->interface[INFINIBAND].status],
+ 			m->interface[INFINIBAND].sendonly ? "Sendonly " : "",
+-			m->mgid_mode->id,
++			mgid_text(m),
+ 			m->interface[INFINIBAND].pending,
+ 			mc_text[m->interface[ROCE].status],
+ 			m->interface[ROCE].sendonly ? "Sendonly" : "",
+@@ -5188,7 +4798,6 @@ skip:
+ static void exec_opt(int op, char *optarg)
+ {
+ 	int ret = 0;
+-	int n;
+ 
+ 	switch (op) {
+ 		case 'b':
+@@ -5221,20 +4830,11 @@ static void exec_opt(int op, char *optar
+ 
+ 		case 'l':
+ 			if (optarg) {
+-				mgid_mode = find_mgid_mode(optarg);
+-				if (mgid_mode)
++				if (find_mgid_mode(optarg))
+ 					break;
+-			}
+-			printf("List of supported MGID formats via -l<id>\n");
+-			printf("=================================\n");
+-			printf(" ID    | Signature | Port in MGID\n");
+-			printf("-------+-----------+-------------\n");
+-			for (n = 0; n < nr_mgid_signatures; n++) {
+-				struct mgid_signature *m = mgid_signatures + n;
++			} else
++				mgids_out();
+ 
+-				printf("%7s|    0x%04x | %s\n",
+-					m->id, m->signature, m->port ? "true" : "false");
+-			}
+ 			exit(1);
+ 			break;
+ 
+@@ -5465,7 +5065,7 @@ static void multicast_cmd(char *paramete
+ 				interfaces_text[in], m->text,
+ 			mc_text[m->interface[in].status],
+ 			m->interface[in].sendonly ? "Sendonly " : "",
+-			in == INFINIBAND ? m->mgid_mode->id : "",
++			in == INFINIBAND ? mgid_text(m) : "",
+ 			m->interface[in].packet_time,
+ 			m->interface[in].max_burst,
+ 			m->interface[in].delayed,
+@@ -5768,7 +5368,7 @@ int main(int argc, char **argv)
+ {
+ 	int op, ret = 0;
+ 
+-	mc_hash = hash_create(offsetof(struct mc, addr), sizeof(struct in_addr));
++	multicast_init();
+ 
+ #ifdef UNICAST
+ 	sidr_state_init();
+@@ -5801,7 +5401,7 @@ int main(int argc, char **argv)
+ 	logg (LOG_NOTICE, "%s device = %s:%d, %s device = %s:%d. Multicast Groups=%d MGIDs=%s Buffers=%u\n",
+ 			interfaces_text[INFINIBAND], i2r[INFINIBAND].rdma_name, i2r[INFINIBAND].port,
+ 			interfaces_text[ROCE], i2r[ROCE].rdma_name, i2r[ROCE].port,
+-			nr_mc, mgid_mode->id, nr_buffers);
++			nr_mc, mgid_text(NULL), nr_buffers);
+ 
+ 	numa_run_on_node(i2r[INFINIBAND].context ? i2r[INFINIBAND].numa_node : i2r[ROCE].numa_node);
+ 	init_buf();	/* Setup interface registers memmory */
+Index: rdma-core/ib2roce/CMakeLists.txt-NO_MSTFLINT
+===================================================================
+--- rdma-core.orig/ib2roce/CMakeLists.txt-NO_MSTFLINT
++++ rdma-core/ib2roce/CMakeLists.txt-NO_MSTFLINT
+@@ -12,6 +12,7 @@ rdma_executable(ib2roce
+   logging.c
+   locking.c
+   buffers.c
++  multicast.c
+ )
+ target_link_libraries(ib2roce LINK_PRIVATE
+   ibverbs

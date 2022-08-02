@@ -2,10 +2,10 @@ Index: rdma-core/ib2roce/CMakeLists.txt-NO_MSTFLINT
 ===================================================================
 --- rdma-core.orig/ib2roce/CMakeLists.txt-NO_MSTFLINT
 +++ rdma-core/ib2roce/CMakeLists.txt-NO_MSTFLINT
-@@ -8,6 +8,7 @@ rdma_executable(ib2roce
-   errno.c
-   ring.c
-   sched.c
+@@ -11,6 +11,7 @@ rdma_executable(ib2roce
+   channel.c
+   logging.c
+   locking.c
 +  buffers.c
  )
  target_link_libraries(ib2roce LINK_PRIVATE
@@ -14,7 +14,7 @@ Index: rdma-core/ib2roce/buffers.c
 ===================================================================
 --- /dev/null
 +++ rdma-core/ib2roce/buffers.c
-@@ -0,0 +1,484 @@
+@@ -0,0 +1,481 @@
 +/*
 + * RDMA Infiniband to ROCE Bridge or Gateway
 + *
@@ -79,70 +79,23 @@ Index: rdma-core/ib2roce/buffers.c
 +#include <poll.h>
 +#include <sys/mman.h>
 +
-+struct buf;
++#include "errno.h"
++#include "locking.h"
++#include "logging.h"
++#include "buffers.h"
 +
-+typedef void receive_callback(struct buf *);
 +/*
 + * Manage freelist using simple single linked list with the pointer
 + * to the next free element at the beginning of the free buffer
 + */
-+static int nr_buffers = 100000;
-+static bool huge = false;
++int nr_buffers = 100000;
++bool huge = false;
 +
-+#define BUFFER_SIZE 8192
-+#define META_SIZE 1024
-+#define DATA_SIZE (BUFFER_SIZE - META_SIZE)
-+/*
-+ * Buf is page aligned and contains 2 pages. The layout attempts to put critical components
-+ * at page boundaries
-+ */
-+struct buf {
-+	uint8_t raw[DATA_SIZE];		/* Raw Frame */
-+	union {
-+		struct {
-+			struct buf *next;	/* Next free buffer */
-+			bool free;
-+			unsigned refcount;	/* Refcount */
-+			uint8_t *cur;		/* Current position in the buffer */
-+			uint8_t *end;		/* Pointer to the last byte in the packet + 1 */
-+
-+			struct rdma_channel *c;	/* Which Channels does this buffer belong to */
-+			struct ibv_wc *w;	/* Work Completion struct */
-+			struct ibv_sge sge;	/* SGE for send */
-+			struct ibv_send_wr wr;	/* Write request */
-+			struct endpoint *source_ep;
-+			struct mc_interface *mi;	/* Destination MC interface / Group */
-+
-+			bool ip_valid;		/* IP header valid */
-+			bool grh_valid;		/* Valid GRH header */
-+			bool imm_valid;		/* unsigned imm is valid */
-+			bool ip_csum_ok;	/* Hardware check if IP CSUM was ok */
-+
-+			unsigned imm;		/* Immediate data from the WC */
-+
-+			/* Structs pulled out of the frame */
-+			struct ibv_grh grh;
-+			struct iphdr ip;
-+		};
-+		uint8_t meta[META_SIZE];
-+	};
-+};
-+
-+static void pull(struct buf *buf, void *dest, unsigned length)
-+{
-+	memcpy(dest, buf->cur, length);
-+	buf->cur += length;
-+}
-+
-+#define PULL(__BUF, __VAR) pull(__BUF, &(__VAR), sizeof(__VAR))
++#define MAX_INLINE_DATA 64
 +
 +#ifdef UNICAST
 +static int send_buf(struct buf *buf, struct rdma_unicast *ra);
 +#endif
-+
-+static struct buf *buffers;
-+
-+static struct buf *nextbuffer;	/* Pointer to next available RDMA buffer */
 +
 +static bool buf_cmpxchg(struct buf **x, struct buf *y, struct buf *z)
 +{
@@ -158,7 +111,7 @@ Index: rdma-core/ib2roce/buffers.c
 +	}
 +}
 +
-+static struct buf *alloc_buffer(struct rdma_channel *c)
++struct buf *alloc_buffer(struct rdma_channel *c)
 +{
 +	struct buf *buf, *next;
 +
@@ -183,8 +136,8 @@ Index: rdma-core/ib2roce/buffers.c
 +#endif
 +	return buf;
 +}
-+ 
-+static void free_buffer(struct buf *buf)
++
++void free_buffer(struct buf *buf)
 +{
 +#ifdef DEBUG
 +	memset(buf->raw, 0, DATA_SIZE);
@@ -196,8 +149,8 @@ Index: rdma-core/ib2roce/buffers.c
 +
 +	} while (!buf_cmpxchg(&nextbuffer, buf->next, buf));
 +}
-+ 
-+static void __get_buf(struct buf *buf)
++
++void __get_buf(struct buf *buf)
 +{
 +	if (!buf->refcount)
 +		panic("Buf refcount zero on __get_buf()\n");
@@ -205,17 +158,17 @@ Index: rdma-core/ib2roce/buffers.c
 +	buf->refcount++;
 +}
 +
-+static void __put_buf(struct buf *buf)
++void __put_buf(struct buf *buf)
 +{
 + 	buf->refcount--;
 + 	if (buf->refcount) {
 + 		return;
 + 	}
-+ 
++
 +	free_buffer(buf);
 +}
-+ 
-+static void get_buf(struct buf *buf)
++
++void get_buf(struct buf *buf)
 +{
 +	unsigned x;
 +
@@ -226,8 +179,8 @@ Index: rdma-core/ib2roce/buffers.c
 +	} else
 +		__get_buf(buf);
 +}
-+ 
-+static void put_buf(struct buf *buf)
++
++void put_buf(struct buf *buf)
 +{
 +	unsigned x;
 +
@@ -241,9 +194,9 @@ Index: rdma-core/ib2roce/buffers.c
 +		__put_buf(buf);
 +
 +}
-+ 
++
 +/* Remove all buffers related to a channel */
-+static void clear_channel_bufs(struct rdma_channel *c)
++void clear_channel_bufs(struct rdma_channel *c)
 +{
 +	struct buf *buf;
 +
@@ -254,7 +207,7 @@ Index: rdma-core/ib2roce/buffers.c
 +	}
 +}
 +
-+static void init_buf(void)
++void init_buf(void)
 +{
 +	int i;
 +	unsigned flags;
@@ -262,8 +215,6 @@ Index: rdma-core/ib2roce/buffers.c
 +
 +	if (sizeof(struct buf) != BUFFER_SIZE)
 +		panic("struct buf is not 8k as required\n");
-+
-+	numa_run_on_node(i2r[INFINIBAND].context ? i2r[INFINIBAND].numa_node : i2r[ROCE].numa_node);
 +
 +	flags = MAP_PRIVATE | MAP_ANONYMOUS;
 +	if (huge)
@@ -279,8 +230,6 @@ Index: rdma-core/ib2roce/buffers.c
 +	if (!buffers)
 +		panic("Cannot allocate %lu KB of memory required for %d buffers. Error %s\n",
 +				x / 1024, nr_buffers, errname());
-+
-+	numa_run_on_node(-1);
 +
 +	/*
 +	 * Free in reverse so that we have a linked list
@@ -301,7 +250,7 @@ Index: rdma-core/ib2roce/buffers.c
 + *
 + * Space in the WR is limited, so it only works for very small packets.
 + */
-+static int send_inline(struct rdma_channel *c, void *addr, unsigned len, struct ah_info *ai, bool imm_used, unsigned imm)
++int send_inline(struct rdma_channel *c, void *addr, unsigned len, struct ah_info *ai, bool imm_used, unsigned imm)
 +{
 +	struct ibv_sge sge = {
 +		.length = len,
@@ -344,7 +293,7 @@ Index: rdma-core/ib2roce/buffers.c
 +/*
 + * Send data to target using native RDMA structs relying on state in struct buf.
 + */
-+static int send_ud(struct rdma_channel *c, struct buf *buf, struct ibv_ah *ah, uint32_t remote_qpn, uint32_t qkey)
++int send_ud(struct rdma_channel *c, struct buf *buf, struct ibv_ah *ah, uint32_t remote_qpn, uint32_t qkey)
 +{
 +	struct ibv_send_wr wr, *bad_send_wr;
 +	struct ibv_sge sge;
@@ -392,7 +341,7 @@ Index: rdma-core/ib2roce/buffers.c
 +}
 +#endif
 +
-+static int send_pending_buffers(struct rdma_channel *c)
++int send_pending_buffers(struct rdma_channel *c)
 +{
 +	while (c->active_send_buffers < c->nr_send) {
 +		struct buf *buf = fifo_get(&c->send_queue);
@@ -407,17 +356,65 @@ Index: rdma-core/ib2roce/buffers.c
 +			errno = ret;
 +			logg(LOG_WARNING, "Failure to post send on %s: %s\n", c->text, errname());
 +			put_buf(buf);
-+		} else 
++		} else
 +			c->active_send_buffers++;
 +	}
 +	return false;
++}
++
++#define SEND_QUEUE_MAX 20
++
++struct rdma_channel *send_queue_table[SEND_QUEUE_MAX];
++
++static void send_queue_add(struct rdma_channel *c)
++{
++	int free = -1;
++	int i;
++
++	for( i = 0; i < SEND_QUEUE_MAX; i++) {
++		struct rdma_channel *r = send_queue_table[i];
++
++		if (!r && free < 0)
++			free = i;
++		else if (r == c)
++			return;
++        }
++
++        if (free >= 0)
++                send_queue_table[free] = c;
++        else
++                panic("No slots left in send_queue\n");
++}
++
++void send_queue_monitor(void *private)
++{
++	int i;
++	bool active;
++
++	for(i = 0; i < SEND_QUEUE_MAX; i++) {
++		struct rdma_channel *c = send_queue_table[i];
++
++		if (!c)
++			continue;
++
++		active = true;
++		if (send_pending_buffers(c)) {
++			/* We just drained the queue */
++			send_queue_table[i] = NULL;
++		}
++
++	}
++
++	add_event(now + milliseconds(active ? 10: 100),
++		send_queue_monitor, NULL, "SendQueue");
++
 +}
 +
 +/*
 + * Send data to a target. No metadata is used in struct buf. However, the buffer must be passed to the wc in order
 + * to be able to free up resources when done.
 + */
-+static int send_to(struct rdma_channel *c,
++int send_to(struct rdma_channel *c,
 +	void *addr, unsigned len, struct ah_info *ai,
 +	bool imm_used, unsigned imm,
 +	struct buf *buf)
@@ -482,7 +479,7 @@ Index: rdma-core/ib2roce/buffers.c
 +
 +#ifdef UNICAST
 +/* Send buffer based on state in struct buf. Unicast only */
-+static int send_buf(struct buf *buf, struct rdma_unicast *ra)
++int send_buf(struct buf *buf, struct rdma_unicast *ra)
 +{
 +	unsigned len = buf->end - buf->cur;
 +	int ret;
@@ -495,7 +492,7 @@ Index: rdma-core/ib2roce/buffers.c
 +	return ret;
 +}
 +
-+static void send_buf_to(struct i2r_interface *i, struct buf *buf, struct sockaddr_in *sin);
++void send_buf_to(struct i2r_interface *i, struct buf *buf, struct sockaddr_in *sin);
 +#endif
 +
 +
@@ -503,7 +500,10 @@ Index: rdma-core/ib2roce/buffers.h
 ===================================================================
 --- /dev/null
 +++ rdma-core/ib2roce/buffers.h
-@@ -0,0 +1,169 @@
+@@ -0,0 +1,192 @@
++#ifndef IB2ROCE_BUFFERS
++#define IB2ROCE_BUFFERS
++
 +/*
 + * DMA Buffer Management
 + *
@@ -567,16 +567,20 @@ Index: rdma-core/ib2roce/buffers.h
 +#include <infiniband/verbs.h>
 +#include <poll.h>
 +#include <sys/mman.h>
++#include <linux/ip.h>
++#include <linux/if_arp.h>
++#include <linux/if_packet.h>
 +
-+struct buf;
++#include "sched.h"
++#include "channel.h"
 +
 +typedef void receive_callback(struct buf *);
 +/*
 + * Manage freelist using simple single linked list with the pointer
 + * to the next free element at the beginning of the free buffer
 + */
-+extern int nr_buffers = 100000;
-+extern bool huge = false;
++extern int nr_buffers;
++extern bool huge;
 +
 +#define BUFFER_SIZE 8192
 +#define META_SIZE 1024
@@ -644,6 +648,19 @@ Index: rdma-core/ib2roce/buffers.h
 +
 +void init_buf(void);
 +
++void clear_channel_bufs(struct rdma_channel *c);
++
++/*
++ * Information provided by RDMA subsystem for how
++ * to send a stream to an endpoint that
++ * maybe multicast or unicast.
++ */
++struct ah_info {
++	struct ibv_ah *ah;      /* Endpoint Identification */
++	uint32_t remote_qpn;    /* Address on the Endpoint */
++	uint32_t remote_qkey;
++};
++
 +/*
 + * Do not use a buffer but simply include data directly into WR.
 + * Advantage: No buffer used and therefore faster since no memory
@@ -654,7 +671,7 @@ Index: rdma-core/ib2roce/buffers.h
 + *
 + * Space in the WR is limited, so it only works for very small packets.
 + */
-+void send_inline(struct rdma_channel *c, void *addr, unsigned len, struct ah_info *ai, bool imm_used, unsigned imm);
++int send_inline(struct rdma_channel *c, void *addr, unsigned len, struct ah_info *ai, bool imm_used, unsigned imm);
 +
 +int send_ud(struct rdma_channel *c, struct buf *buf, struct ibv_ah *ah, uint32_t remote_qpn, uint32_t qkey);
 +
@@ -670,6 +687,536 @@ Index: rdma-core/ib2roce/buffers.h
 +int send_buf(struct buf *buf, struct rdma_unicast *ra);
 +void send_buf_to(struct i2r_interface *i, struct buf *buf, struct sockaddr_in *sin);
 +
++int send_pending_buffers(struct rdma_channel *c);
++void send_queue_monitor(void *private);
++
 +#endif
 +
 +
+Index: rdma-core/ib2roce/ib2roce.c
+===================================================================
+--- rdma-core.orig/ib2roce/ib2roce.c
++++ rdma-core/ib2roce/ib2roce.c
+@@ -82,6 +82,7 @@
+ #include "sched.h"
+ #include "logging.h"
+ #include "locking.h"
++#include "buffers.h"
+ 
+ #include "ibraw.h"
+ #include "cma-hdr.h"
+@@ -253,17 +254,6 @@ static struct i2r_interface {
+ 	struct hash *pgm_record_hash;
+ } i2r[NR_INTERFACES];
+ 
+-/*
+- * Information provided by RDMA subsystem for how
+- * to send a stream to an endpoint that
+- * maybe multicast or unicast.
+- */
+-struct ah_info {
+-	struct ibv_ah *ah;	/* Endpoint Identification */
+-	uint32_t remote_qpn;	/* Address on the Endpoint */
+-	uint32_t remote_qkey;
+-};
+-
+ #ifdef UNICAST
+ /*
+  * A Unicastconnection to a certain port and host with
+@@ -773,217 +763,12 @@ static int leave_mc(enum interfaces i)
+ 	return 0;
+ }
+ 
+-/*
+- * Manage freelist using simple single linked list with the pointer
+- * to the next free element at the beginning of the free buffer
+- */
+-static int nr_buffers = 100000;
+-static bool huge = false;
+-
+-#define BUFFER_SIZE 8192
+-#define META_SIZE 1024
+-#define DATA_SIZE (BUFFER_SIZE - META_SIZE)
+-/*
+- * Buf is page aligned and contains 2 pages. The layout attempts to put critical components
+- * at page boundaries
+- */
+-struct buf {
+-	uint8_t raw[DATA_SIZE];		/* Raw Frame */
+-	union {
+-		struct {
+-			struct buf *next;	/* Next free buffer */
+-			bool free;
+-			unsigned refcount;	/* Refcount */
+-			uint8_t *cur;		/* Current position in the buffer */
+-			uint8_t *end;		/* Pointer to the last byte in the packet + 1 */
+-
+-			struct rdma_channel *c;	/* Which Channels does this buffer belong to */
+-			struct ibv_wc *w;	/* Work Completion struct */
+-			struct ibv_sge sge;	/* SGE for send */
+-			struct ibv_send_wr wr;	/* Write request */
+-			struct endpoint *source_ep;
+-			struct mc_interface *mi;	/* Destination MC interface / Group */
+-
+-			bool ip_valid;		/* IP header valid */
+-			bool grh_valid;		/* Valid GRH header */
+-			bool imm_valid;		/* unsigned imm is valid */
+-			bool ip_csum_ok;	/* Hardware check if IP CSUM was ok */
+-
+-			unsigned imm;		/* Immediate data from the WC */
+-
+-			/* Structs pulled out of the frame */
+-			struct ibv_grh grh;
+-			struct iphdr ip;
+-		};
+-		uint8_t meta[META_SIZE];
+-	};
+-};
+-
+-static void pull(struct buf *buf, void *dest, unsigned length)
+-{
+-	memcpy(dest, buf->cur, length);
+-	buf->cur += length;
+-}
+-
+-#define PULL(__BUF, __VAR) pull(__BUF, &(__VAR), sizeof(__VAR))
+-
+ static void beacon_received(struct mc *, enum interfaces, struct buf *buf);
+ 
+ #ifdef UNICAST
+ static int send_buf(struct buf *buf, struct rdma_unicast *ra);
+ #endif
+ 
+-static struct buf *buffers;
+-
+-static struct buf *nextbuffer;	/* Pointer to next available RDMA buffer */
+-
+-static bool buf_cmpxchg(struct buf **x, struct buf *y, struct buf *z)
+-{
+-	if (multithreaded) {
+-		return atomic_compare_exchange_weak(x, &y, z);
+-
+-	} else {
+-		if (*x == y) {
+-			*x = z;
+-			return true;
+-		}
+-		return false;
+-	}
+-}
+-
+-static struct buf *alloc_buffer(struct rdma_channel *c)
+-{
+-	struct buf *buf, *next;
+-
+-	do {
+-		buf = nextbuffer;
+-		if (!buf)
+-			return NULL;
+-
+-		next = buf->next;
+-	} while (!buf_cmpxchg(&nextbuffer, buf, next));
+-
+-	buf->free = false;
+-	buf->c = c;
+-	buf->refcount = 1;
+-
+-#ifdef DEBUG
+-	buf->next = NULL;
+-
+-	for(uint8_t *q = buf->raw; q < buf->raw + DATA_SIZE; q++)
+-		if (*q)
+-			panic("buffer content not zeroed\n");
+-#endif
+-	return buf;
+-}
+- 
+-static void free_buffer(struct buf *buf)
+-{
+-#ifdef DEBUG
+-	memset(buf->raw, 0, DATA_SIZE);
+-#endif
+-	buf->free = true;
+-
+-	do {
+-		buf->next = nextbuffer;
+-
+-	} while (!buf_cmpxchg(&nextbuffer, buf->next, buf));
+-}
+- 
+-static void __get_buf(struct buf *buf)
+-{
+-	if (!buf->refcount)
+-		panic("Buf refcount zero on __get_buf()\n");
+-
+-	buf->refcount++;
+-}
+-
+-static void __put_buf(struct buf *buf)
+-{
+- 	buf->refcount--;
+- 	if (buf->refcount) {
+- 		return;
+- 	}
+- 
+-	free_buffer(buf);
+-}
+- 
+-static void get_buf(struct buf *buf)
+-{
+-	unsigned x;
+-
+-	if (multithreaded) {
+-		x = atomic_fetch_add(&buf->refcount, 1);
+-		if (!x)
+-			panic("Buf refcount zero in get_buf()\n");
+-	} else
+-		__get_buf(buf);
+-}
+- 
+-static void put_buf(struct buf *buf)
+-{
+-	unsigned x;
+-
+-	if (multithreaded) {
+-		x = atomic_fetch_sub(&buf->refcount, 1);
+-		if (x > 1)
+- 			return;
+-
+-		free_buffer(buf);
+-	} else
+-		__put_buf(buf);
+-
+-}
+- 
+-/* Remove all buffers related to a channel */
+-static void clear_channel_bufs(struct rdma_channel *c)
+-{
+-	struct buf *buf;
+-
+-	for (buf = buffers; buf < buffers + nr_buffers; buf++) {
+-
+-		if (!buf->free && buf->c == c)
+-			free_buffer(buf);
+-	}
+-}
+-
+-static void init_buf(void)
+-{
+-	int i;
+-	unsigned flags;
+-	unsigned long x = nr_buffers;
+-
+-	if (sizeof(struct buf) != BUFFER_SIZE)
+-		panic("struct buf is not 8k as required\n");
+-
+-	numa_run_on_node(i2r[INFINIBAND].context ? i2r[INFINIBAND].numa_node : i2r[ROCE].numa_node);
+-
+-	flags = MAP_PRIVATE | MAP_ANONYMOUS;
+-	if (huge)
+-		flags |= MAP_HUGETLB;
+-
+-	x *= BUFFER_SIZE;
+-
+-	if (x > 1000000000)
+-		logg(LOG_INFO, "Allocate %lu MByte of memory for %u buffers\n",
+-				x / 1024 / 1024, nr_buffers);
+-
+-	buffers = mmap(0, x, PROT_READ|PROT_WRITE, flags, -1, 0);
+-	if (!buffers)
+-		panic("Cannot allocate %lu KB of memory required for %d buffers. Error %s\n",
+-				x / 1024, nr_buffers, errname());
+-
+-	numa_run_on_node(-1);
+-
+-	/*
+-	 * Free in reverse so that we have a linked list
+-	 * starting at the first element which points to
+-	 * the second and so on.
+-	 */
+-	for (i = nr_buffers; i > 0; i--)
+-		free_buffer(&buffers[i-1]);
+-}
+-
+ typedef bool setup_callback(struct rdma_channel *c);
+ static receive_callback receive_multicast;
+ #ifdef UNICAST
+@@ -2459,258 +2244,7 @@ err:
+ #endif
+ }
+ 
+-/*
+- * Do not use a buffer but simply include data directly into WR.
+- * Advantage: No buffer used and therefore faster since no memory
+- * fetch has to be done by the RDMA subsystem and no completion
+- * event has to be handled.
+- *
+- * No MR is being used so this works for any QP.
+- *
+- * Space in the WR is limited, so it only works for very small packets.
+- */
+-static int send_inline(struct rdma_channel *c, void *addr, unsigned len, struct ah_info *ai, bool imm_used, unsigned imm)
+-{
+-	struct ibv_sge sge = {
+-		.length = len,
+-		.addr = (uint64_t)addr
+-	};
+-	struct ibv_send_wr wr = {
+-		.sg_list = &sge,
+-		.num_sge = 1,
+-		.opcode = imm_used ? IBV_WR_SEND_WITH_IMM : IBV_WR_SEND,
+-		.send_flags = IBV_SEND_INLINE,
+-		.imm_data = imm,
+-		.wr = {
+-			/* Get addr info  */
+-			.ud = {
+-				.ah = ai->ah,
+-				.remote_qpn = ai->remote_qpn,
+-				.remote_qkey = ai->remote_qkey
+-			}
+-		}
+-
+-	};
+-	struct ibv_send_wr *bad_send_wr;
+-	int ret;
+-
+-	if (len > MAX_INLINE_DATA)
+-		return -E2BIG;
+-
+-	ret = ibv_post_send(c->qp, &wr, &bad_send_wr);
+-	if (ret) {
+-		errno = -ret;
+-		logg(LOG_ERR, "Failed to post inline send: %s on %s\n", errname(), c->text);
+-	} else
+-		logg(LOG_INFO, "Inline Send to QPN=%d QKEY=%x %d bytes\n",
+-				wr.wr.ud.remote_qpn, wr.wr.ud.remote_qkey, len);
+-
+-	return ret;
+-}
+-
+-#ifdef UNICAST
+-/*
+- * Send data to target using native RDMA structs relying on state in struct buf.
+- */
+-static int send_ud(struct rdma_channel *c, struct buf *buf, struct ibv_ah *ah, uint32_t remote_qpn, uint32_t qkey)
+-{
+-	struct ibv_send_wr wr, *bad_send_wr;
+-	struct ibv_sge sge;
+-	int ret;
+-	unsigned len = buf->end - buf->cur;
+-
+-	buf->c = c;	/* Change ownership to sending channel */
+-	buf->w = NULL;
+-
+-	memset(&wr, 0, sizeof(wr));
+-	wr.sg_list = &sge;
+-	wr.num_sge = 1;
+-	wr.opcode = buf->imm_valid ? IBV_WR_SEND_WITH_IMM : IBV_WR_SEND;
+-	wr.imm_data = buf->imm;
+-	wr.send_flags = IBV_SEND_SIGNALED;
+-	wr.wr_id = (uint64_t)buf;
+-
+-	/* Get addr info  */
+-	wr.wr.ud.ah = ah;
+-	wr.wr.ud.remote_qpn = remote_qpn;
+-	wr.wr.ud.remote_qkey = qkey;
+-
+-	sge.length = buf->end - buf->cur;
+-	sge.lkey = c->mr->lkey;
+-	sge.addr = (uint64_t)buf->cur;
+-
+-	if (len <= MAX_INLINE_DATA) {
+-		wr.send_flags = IBV_SEND_INLINE;
+-		ret = ibv_post_send(c->qp, &wr, &bad_send_wr);
+-	} else {
+-		get_buf(buf);
+-		c->active_send_buffers++;
+-		ret = ibv_post_send(c->qp, &wr, &bad_send_wr);
+-	}
+-
+-	if (ret) {
+-		errno = ret;
+-		logg(LOG_WARNING, "Failed to post send: %s on %s. Active Receive Buffers=%d/%d Active Send Buffers=%d\n", errname(), c->text, c->active_receive_buffers, c->nr_receive, c->active_send_buffers);
+-		stop_channel(c);
+-	} else
+-		logg(LOG_DEBUG, "RDMA Send to QPN=%d QKEY=%x %d bytes\n",
+-			wr.wr.ud.remote_qpn, wr.wr.ud.remote_qkey, len);
+-
+-	return ret;
+-}
+-#endif
+-
+-static int send_pending_buffers(struct rdma_channel *c)
+-{
+-	while (c->active_send_buffers < c->nr_send) {
+-		struct buf *buf = fifo_get(&c->send_queue);
+-		struct ibv_send_wr *bad_send_wr;
+-		int ret;
+-
+-		if (!buf)
+-			return true;
+-
+-		ret = ibv_post_send(c->qp, &buf->wr, &bad_send_wr);
+-		if (ret) {
+-			errno = ret;
+-			logg(LOG_WARNING, "Failure to post send on %s: %s\n", c->text, errname());
+-			put_buf(buf);
+-		} else 
+-			c->active_send_buffers++;
+-	}
+-	return false;
+-}
+-
+-#define SEND_QUEUE_MAX 20
+-
+-struct rdma_channel *send_queue_table[SEND_QUEUE_MAX];
+-
+-static void send_queue_monitor(void *private)
+-{
+-	int i;
+-	bool active;
+-
+-	for(i = 0; i < SEND_QUEUE_MAX; i++) {
+-		struct rdma_channel *c = send_queue_table[i];
+-
+-		if (!c)
+-			continue;
+-
+-		active = true;
+-		if (send_pending_buffers(c)) {
+-			/* We just drained the queue */
+-			send_queue_table[i] = NULL;
+-		}
+-
+-	}
+-
+-	add_event(now + milliseconds(active ? 10: 100),
+-		send_queue_monitor, NULL, "SendQueue");
+-
+-}
+-
+-static void send_queue_add(struct rdma_channel *c)
+-{
+-	int free = -1;
+-	int i;
+-
+-	for( i = 0; i < SEND_QUEUE_MAX; i++) {
+-		struct rdma_channel *r = send_queue_table[i];
+-
+-		if (!r && free < 0)
+-			free = i;
+-		else if (r == c)
+-			return;
+-	}
+-
+-	if (free >= 0)
+-		send_queue_table[free] = c;
+-	else
+-		panic("No slots left in send_queue\n");
+-}
+-
+-/*
+- * Send data to a target. No metadata is used in struct buf. However, the buffer must be passed to the wc in order
+- * to be able to free up resources when done.
+- */
+-static int send_to(struct rdma_channel *c,
+-	void *addr, unsigned len, struct ah_info *ai,
+-	bool imm_used, unsigned imm,
+-	struct buf *buf)
+-{
+-	int ret;
+-	struct ibv_send_wr *bad_send_wr;
+-
+-	if (!ai->ah)
+-		panic("Send without a route to a destination\n");
+-
+-	buf->c = c;	/* Change ownership to sending channel */
+-	buf->w = NULL;
+-
+-	memset(&buf->wr, 0, sizeof(struct ibv_send_wr));
+-	buf->wr.sg_list = &buf->sge;
+-	buf->wr.num_sge = 1;
+-	buf->wr.opcode = imm_used ? IBV_WR_SEND_WITH_IMM: IBV_WR_SEND;
+-	buf->wr.send_flags = IBV_SEND_SIGNALED;
+-	buf->wr.wr_id = (uint64_t)buf;
+-	buf->wr.imm_data = imm;
+-
+-	/* Get addr info  */
+-	buf->wr.wr.ud.ah = ai->ah;
+-	buf->wr.wr.ud.remote_qpn = ai->remote_qpn;
+-	buf->wr.wr.ud.remote_qkey = ai->remote_qkey;
+-
+-	buf->sge.length = len;
+-	buf->sge.lkey = c->mr->lkey;
+-	buf->sge.addr = (uint64_t)addr;
+-
+-	if (!fifo_empty(&c->send_queue) || c->active_send_buffers >= c->nr_send)
+-		goto queue;
+-
+-	c->active_send_buffers++;
+-	ret = ibv_post_send(c->qp, &buf->wr, &bad_send_wr);
+-	if (ret) {
+-		if (errno == ENOMEM)
+-			goto queue;
+-
+-		errno = ret;
+-		logg(LOG_WARNING, "Failed to post send: %s on %s. Active Receive Buffers=%d/%d Active Send Buffers=%d\n", errname(), c->text, c->active_receive_buffers, c->nr_receive, c->active_send_buffers);
+-		put_buf(buf);
+-	} else {
+-		logg(LOG_DEBUG, "RDMA Send to QPN=%d QKEY=%x %d bytes\n",
+-			buf->wr.wr.ud.remote_qpn, buf->wr.wr.ud.remote_qkey, len);
+-	}
+-
+-	return ret;
+-
+-queue:
+-	if (fifo_put(&c->send_queue, buf) && !current)
+-		/*
+-		 * This moves the handling onto the high latency thread.
+-		 * Adding the queue is only required when we add the first
+-		 * buffer
+-		 */
+-		send_queue_add(c);
+-
+-	st(c, packets_queued);
+-	return 0;
+-}
+-
+ #ifdef UNICAST
+-/* Send buffer based on state in struct buf. Unicast only */
+-static int send_buf(struct buf *buf, struct rdma_unicast *ra)
+-{
+-	unsigned len = buf->end - buf->cur;
+-	int ret;
+-
+-	if (len < MAX_INLINE_DATA) {
+-		ret = send_inline(ra->c, buf->cur, len, &ra->ai, buf->imm_valid, buf->imm);
+-	} else
+-		ret = send_to(ra->c, buf->cur, len, &ra->ai, buf->imm_valid, buf->imm, buf);
+-
+-	return ret;
+-}
+-
+ static struct rdma_unicast *new_rdma_unicast(struct i2r_interface *i, struct sockaddr_in *sin)
+ {
+ 	struct rdma_unicast *ra = calloc(1, sizeof(struct rdma_unicast));
+@@ -2784,8 +2318,6 @@ static void unicast_packet(struct rdma_c
+ 
+ 	dump_buf_grh(buf);
+ }
+-
+-static void send_buf_to(struct i2r_interface *i, struct buf *buf, struct sockaddr_in *sin);
+ #endif
+ 
+ static void list_endpoints(struct i2r_interface *i)
+@@ -6271,7 +5803,10 @@ int main(int argc, char **argv)
+ 			interfaces_text[ROCE], i2r[ROCE].rdma_name, i2r[ROCE].port,
+ 			nr_mc, mgid_mode->id, nr_buffers);
+ 
++	numa_run_on_node(i2r[INFINIBAND].context ? i2r[INFINIBAND].numa_node : i2r[ROCE].numa_node);
+ 	init_buf();	/* Setup interface registers memmory */
++	numa_run_on_node(-1);
++
+ 	init_pgm_streams();
+ 
+ 	setup_interface(INFINIBAND);

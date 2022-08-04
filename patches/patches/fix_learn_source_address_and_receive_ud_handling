@@ -1,0 +1,24 @@
+Index: rdma-core/ib2roce/ib2roce.c
+===================================================================
+--- rdma-core.orig/ib2roce/ib2roce.c
++++ rdma-core/ib2roce/ib2roce.c
+@@ -2569,7 +2569,7 @@ static void learn_source_address(struct
+ 	if (!unicast)	/* If unicast is not enabled then dont bother to gather addresses */
+ 		return;
+ 
+-	buf_to_ep(buf);
++	buf->source_ep = buf_to_ep(buf);
+ }
+ 
+ /*
+@@ -3341,6 +3341,10 @@ static void receive_ud(struct buf *buf)
+ 
+ 	learn_source_address(buf);
+ 
++	if (!buf->grh_valid)
++		/* Even if there is no GRH there is space reserved at the beginning for UD packets */
++		buf->cur += 40;
++
+ 	e = buf->source_ep;
+ 	if (!e) {
+ 		reason = "Cannot find endpoint";

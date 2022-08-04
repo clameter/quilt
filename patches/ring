@@ -2,7 +2,7 @@ Index: rdma-core/ib2roce/ring.c
 ===================================================================
 --- /dev/null
 +++ rdma-core/ib2roce/ring.c
-@@ -0,0 +1,201 @@
+@@ -0,0 +1,203 @@
 +/*
 + * RDMA Infiniband to ROCE Bridge or Gateway
 + *
@@ -124,8 +124,10 @@ Index: rdma-core/ib2roce/ring.c
 +	len = r->buf[r->head];
 +	head = r->head + 1 + len;
 +
-+	if (len < 5 || len > max_len)
++	if (len < 2 || len > max_len) {
++		printf("Ring_get len = %d\n", len);
 +		abort();
++	}
 +
 +	if (head <= r->tail || (r->tail < r->head && head <= r->size)) {
 +		memcpy(msg, r->buf + r->head + 1, len);
@@ -250,7 +252,7 @@ Index: rdma-core/ib2roce/ring.h
 +#include <stdarg.h>
 +#include <sys/types.h>
 +
-+#define RING_SIZE 100
++#define RING_SIZE 10000
 +
 +struct ring {		/* head and tail can never point ot the end of buf */
 +	unsigned head;	/* The next byte to be read. Updated by ring_get() */

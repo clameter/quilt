@@ -1,0 +1,44 @@
+Index: rdma-core/ib2roce/ib2roce.c
+===================================================================
+--- rdma-core.orig/ib2roce/ib2roce.c
++++ rdma-core/ib2roce/ib2roce.c
+@@ -179,7 +179,7 @@ static const char *stats_text[nr_stats]
+ 
+ static int cq_high = 0;	/* Largest batch of CQs encountered */
+ 
+-enum channel_type { channel_rdmacm, channel_ud, channel_raw, channel_packet, nr_channel_types };
++enum channel_type { channel_rdmacm, channel_ud, channel_qp1, channel_raw, channel_packet, nr_channel_types };
+ 
+ struct buf;
+ 
+@@ -1200,18 +1200,17 @@ static void start_channel(struct rdma_ch
+ 	if (ret)
+ 		logg(LOG_CRIT, "ibv_modify_qp: Error when moving %s to RTR state. %s\n", c->text, errname());
+ 
+-	if (c->type == channel_ud) {
++	if (c->type == channel_ud || c->type == channel_qp1) {
+ 
+ 		c->attr.qp_state = IBV_QPS_RTS;
+-		ret = ibv_modify_qp(c->qp, &c->attr,
+-			       c->type == channel_ud ? (IBV_QP_STATE | IBV_QP_SQ_PSN) : IBV_QP_STATE);
++		ret = ibv_modify_qp(c->qp, &c->attr, IBV_QP_STATE | IBV_QP_SQ_PSN);
+ 
+ 		if (ret)
+ 			logg(LOG_CRIT, "ibv_modify_qp: Error when moving %s to RTS state. %s\n", c->text, errname());
+ 
+ 	}
+ 	logg(LOG_NOTICE, "QP %s moved to state %s: QPN=0x%x\n",
+-		 c->text,  c->type == channel_ud ? "RTS/RTR" : "RTR", c->qp->qp_num);
++		 c->text,  (c->type == channel_ud || c->type == channel_qp1)? "RTS/RTR" : "RTR", c->qp->qp_num);
+ }
+ 
+ static void stop_channel(struct rdma_channel *c)
+@@ -1515,7 +1514,7 @@ static struct rdma_channel *create_qp1_c
+ {
+ 	struct rdma_channel *c;
+ 
+-	c = new_rdma_channel(i, receive_qp1, channel_ud, "qp1");
++	c = new_rdma_channel(i, receive_qp1, channel_qp1, "qp1");
+ 	init_channel(c, IB_DEFAULT_QP1_QKEY, i->port, 10,  IBV_QPT_UD);
+ 	c->max_receive_buffers = 9;
+ 	if (c->qp)

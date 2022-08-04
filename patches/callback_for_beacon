@@ -1,0 +1,58 @@
+Index: rdma-core/ib2roce/ib2roce.c
+===================================================================
+--- rdma-core.orig/ib2roce/ib2roce.c
++++ rdma-core/ib2roce/ib2roce.c
+@@ -653,7 +653,7 @@ struct mc_interface {
+ static struct mc {
+ 	struct in_addr addr;
+ 	struct mc_interface interface[2];
+-	bool beacon;
++	void (*callback)(struct mc *, enum interfaces, struct buf *);
+ 	uint8_t tos_mode;
+ 	uint16_t port;
+ 	struct mgid_signature *mgid_mode;
+@@ -980,7 +980,7 @@ static void pull(struct buf *buf, void *
+ 
+ #define PULL(__BUF, __VAR) pull(__BUF, &(__VAR), sizeof(__VAR))
+ 
+-static void beacon_received(struct buf *buf);
++static void beacon_received(struct mc *, enum interfaces, struct buf *buf);
+ 
+ #ifdef UNICAST
+ static int send_buf(struct buf *buf, struct rdma_unicast *ra);
+@@ -4031,8 +4031,8 @@ static void receive_multicast(struct buf
+ 
+ 	}
+ 
+-	if (m->beacon) {
+-		beacon_received(buf);
++	if (m->callback) {
++		m->callback(m, in, buf);
+ 		return;
+ 	}
+ 
+@@ -5286,7 +5286,7 @@ static void prep_beacon_struct(struct i2
+ 	}
+ }
+ 
+-static void beacon_received(struct buf *buf)
++static void beacon_received(struct mc *m, enum interfaces in, struct buf *buf)
+ {
+ 	struct beacon_info *b = (struct beacon_info *)buf->cur;
+ 	char bridge[40];
+@@ -5422,7 +5422,6 @@ static void beacon_setup(const char *opt
+ 		struct mc *m = mcs + nr_mc++;
+ 
+ 		memset(m, 0, sizeof(*m));
+-		m->beacon = true;
+ 		m->text = strdup(opt_arg);
+ 		m->mgid_mode = mgid;
+ 		m->tos_mode = tos;
+@@ -5437,6 +5436,7 @@ static void beacon_setup(const char *opt
+ 			beacon_sin = NULL;
+ 		} else
+ 			beacon_mc = m;
++		m->callback = beacon_received;
+ 	}
+ 	add_event(timestamp() + ONE_SECOND, beacon_send, NULL, "Send Beacon");
+ }

@@ -1,0 +1,219 @@
+Index: rdma-core/ib2roce/ib2roce.c
+===================================================================
+--- rdma-core.orig/ib2roce/ib2roce.c
++++ rdma-core/ib2roce/ib2roce.c
+@@ -132,6 +132,31 @@ static void logg(int prio, const char *f
+ 		vprintf(fmt, valist);
+ }
+ 
++static pthread_mutex_t mutex;		/* Generic serialization mutex */
++
++static void lock(void)
++{
++	if (pthread_mutex_lock(&mutex))
++		logg(LOG_ERR, "Mutex lock failed: %s\n", errname());
++}
++
++static void unlock(void)
++{
++	if (pthread_mutex_unlock(&mutex))
++		logg(LOG_ERR, "Mutex unlock failed: %s\n", errname());
++}
++
++static bool trylock(void)
++{
++	if (pthread_mutex_trylock(&mutex)) {
++		if (errno != EBUSY)
++			logg(LOG_ERR, "Mutex trylock failed: %s\n", errname());
++		return false;
++	}
++	return true;
++}
++
++
+ const struct in_addr ip_none = { .s_addr = 0 };
+ 
+ /*
+@@ -526,10 +551,14 @@ static struct mc *hash_lookup_mc(struct
+ 
+ static int hash_add_mc(struct mc *m)
+ {
++	lock();
++
+ 	if (hash_find(mc_hash, &m->addr))
+ 		return -EEXIST;
+ 
+ 	hash_add(mc_hash, m);
++
++	unlock();
+ 	return 0;
+ }
+ 
+@@ -1003,8 +1032,6 @@ struct core_info {
+ 	thread_callback *callback;
+ } core_infos[MAX_CORE];
+ 
+-static pthread_mutex_t mutex;		/* Generic serialization mutex */
+-
+ static struct rdma_channel *new_rdma_channel(struct i2r_interface *i, enum channel_type type)
+ {
+ 	struct rdma_channel *c;
+@@ -2630,7 +2657,7 @@ static struct endpoint *at_to_ep(struct
+ 	if (!at->dlid && !addr.s_addr)
+ 		abort();		/* Nothing given that could be resolved */
+ 
+-
++redo:
+ 	if (at->dlid) {
+ 
+ 		if (i == i2r + ROCE)
+@@ -2638,10 +2665,15 @@ static struct endpoint *at_to_ep(struct
+ 
+ 		ep = hash_find(i->ep, &at->dlid);
+ 		if (ep) {
+-			if (ep->addr.s_addr == 0 && addr.s_addr) {
++			if (ep->addr.s_addr == 0 && addr.s_addr)
++			{
+ 				/* Ok we can add the IP address that was unknown earlier */
+-				ep->addr = addr;
++				lock();
++				ep = hash_find(i->ep, &at->dlid);
++				if (ep && ep->addr.s_addr == 0)
++					ep->addr = addr;
+ 				hash_add(i->ip_to_ep, &ep);
++				unlock();
+ 			}
+ 			return ep;
+ 		}
+@@ -2652,8 +2684,12 @@ static struct endpoint *at_to_ep(struct
+ 		if (ep) {
+ 			if (at->dlid && ep->lid == 0 && unicast_lid(at->dlid)) {
+ 				/* Add earlier unknown LID */
+-				ep->lid = at->dlid;
++				lock();
++				ep = hash_find(i->ip_to_ep, &addr.s_addr);
++				if (ep->lid == 0)
++					ep->lid = at->dlid;
+ 				hash_add(i->ep, &ep);
++				unlock();
+ 			}
+ 			return ep;
+ 		}
+@@ -2730,13 +2766,24 @@ static struct endpoint *at_to_ep(struct
+ 	ep->lid = at->dlid;
+ 	ep->ah = ah;
+ 
+-	/* Dont add the address if it has not been determined yet */
+-	if (addr.s_addr)
+-		hash_add(i->ip_to_ep, ep);
+-
+-	/* But IB must have the LID defined so we can at least add that hash */
+-	if (i2r + INFINIBAND == i)
+-		hash_add(i->ep, ep);
++	lock();
++
++	if (!hash_find(i->ip_to_ep, ep) && (i == i2r + ROCE || !hash_find(i->ep, ep))) {
++
++		/* Dont add the address if it has not been determined yet */
++		if (addr.s_addr)
++			hash_add(i->ip_to_ep, ep);
++
++		/* But IB must have the LID defined so we can at least add that hash */
++		if (i2r + INFINIBAND == i)
++			hash_add(i->ep, ep);
++	} else	/* Concurrent update. Need to redo this action */
++		ep = NULL;
++
++	unlock();
++
++	if (!ep)
++		goto redo;
+ 
+ 	return ep;
+ }
+@@ -3048,9 +3095,16 @@ static const char *process_arp(struct i2
+ 		ep = hash_find(i->ep, i2r + ROCE == i ? (void *)&addr : (void *)(lids + j));
+ 		if (ep) {
+ 			if (!ep->addr.s_addr) {
++				lock();
+ 
+-				ep->addr = addr;
+-				hash_add(i->ip_to_ep, ep);
++				ep = hash_find(i->ep, i2r + ROCE == i ? (void *)&addr : (void *)(lids + j));
++				if (!ep->addr.s_addr) {
++
++					ep->addr = addr;
++					hash_add(i->ip_to_ep, ep);
++				}
++
++				unlock();
+ 
+ 			} else if(ep->addr.s_addr != addr.s_addr)
+ 
+@@ -3232,6 +3286,8 @@ no_cma:
+ 			goto err;
+ 		}
+ 
++		lock();
++
+ 		if (valid_addr(source_i, source) && ss->source->addr.s_addr == 0) {
+ 			struct endpoint *sep = hash_find(source_i->ip_to_ep, &source);
+ 
+@@ -3267,6 +3323,8 @@ no_cma:
+ 					inet_ntoa(source), w->slid);
+ 			}
+ 		}
++
++		unlock();
+ 	}
+ 
+ 	ss->dest = ip_to_ep(dest_i, dest);
+@@ -3275,6 +3333,8 @@ no_cma:
+ 		goto err;
+ 	}
+ 
++	lock();
++
+ 	if (hash_find(sidrs, &ss->request_id)) {
+ 		logg(LOG_WARNING, "SIDR_REQ: Removed earlier pending request\n");
+ 		hash_del(sidrs, &ss->request_id);
+@@ -3294,6 +3354,8 @@ no_cma:
+ 		free_buffer(buf);
+ 	}
+ 
++	unlock();
++
+ 	return NULL;
+ 
+ err:
+@@ -3335,15 +3397,21 @@ static const char * sidr_rep(struct buf
+ 	if (sr_qkey != RDMA_UDP_QKEY)
+ 		logg(LOG_WARNING, "%s: Nonstandard QKEY = %x\n", buf->c->text, sr_qkey);
+ 
++	lock();
++
+ 	ss = hash_find(sidrs, &sr->request_id);
+ 	if (!ss)
+ 		return "SDIR_REP: Cannot find outstanding SIDR_REQ";
+ 
+ 	hash_del(sidrs, ss);
+ 
++	unlock();
++
+ 	if (ss->dest != buf->source_ep)
+ 		abort();
+ 
++	lock();
++
+ 	if (find_forward(ss->source, (buf->c->i == i2r + INFINIBAND) ? NULL : ss->dest, ss->source_qp))
+ 		return "Ignoring SIDR REQ since one is already pending";
+ 
+@@ -3353,6 +3421,8 @@ static const char * sidr_rep(struct buf
+ 		/* Add the reverse forward if we have the source_qp number */
+ 		add_forward(ss->dest, sr_qpn, ss->source, ss->source_qp, sr_qkey);
+ 
++	unlock();
++
+ 	qpn_word = (ss->source->i->ud->qp->qp_num << 8) | (qpn_word & 0xff);
+ 	sr->qpn = htonl(qpn_word);
+ 

@@ -1,0 +1,94 @@
+Index: rdma-core/ib2roce/ib2roce.c
+===================================================================
+--- rdma-core.orig/ib2roce/ib2roce.c
++++ rdma-core/ib2roce/ib2roce.c
+@@ -2047,24 +2047,27 @@ static void setup_interface(enum interfa
+ 	}
+ 	register_callback(handle_rdma_event, i->rdma_events->fd, i);
+ 
+-	i->pd = ibv_alloc_pd(i->context);
+-	if (!i->pd) {
+-		logg(LOG_CRIT, "ibv_alloc_pd failed for %s.\n", i->text);
+-		abort();
+-	}
++	if (unicast) {
++		
++		i->pd = ibv_alloc_pd(i->context);
++		if (!i->pd) {
++			logg(LOG_CRIT, "ibv_alloc_pd failed for %s.\n", i->text);
++			abort();
++		}
+ 
+-	i->comp_events = ibv_create_comp_channel(i->context);
+-	if (!i->comp_events) {
+-		logg(LOG_CRIT, "ibv_create_comp_channel failed for %s : %s.\n",
+-			i->text, errname());
+-		abort();
+-	}
+-	register_callback(handle_comp_event, i->comp_events->fd, i->comp_events);
++		i->comp_events = ibv_create_comp_channel(i->context);
++		if (!i->comp_events) {
++			logg(LOG_CRIT, "ibv_create_comp_channel failed for %s : %s.\n",
++				i->text, errname());
++			abort();
++		}
++		register_callback(handle_comp_event, i->comp_events->fd, i->comp_events);
+ 
+-	i->mr = ibv_reg_mr(i->pd, buffers, nr_buffers * sizeof(struct buf), IBV_ACCESS_LOCAL_WRITE);
+-	if (!i->mr) {
+-		logg(LOG_CRIT, "ibv_reg_mr failed for %s:%s.\n", i->text, errname());
+-		abort();
++		i->mr = ibv_reg_mr(i->pd, buffers, nr_buffers * sizeof(struct buf), IBV_ACCESS_LOCAL_WRITE);
++		if (!i->mr) {
++			logg(LOG_CRIT, "ibv_reg_mr failed for %s:%s.\n", i->text, errname());
++			abort();
++		}
+ 	}
+ 
+ 	i->multicast = new_rdma_channel(i, channel_rdmacm);
+@@ -4577,16 +4580,24 @@ static void handle_comp_event(void *priv
+ 	int cqs;
+ 	struct ibv_wc wc[max_wc_cqs];
+ 
+-	ibv_get_cq_event(events, &cq, (void **)&c);
++	if (ibv_get_cq_event(events, &cq, (void **)&c)) {
++		logg(LOG_ERR, "ibv_get_cq_event failed with %s\n", errname());
++		return;
++	}
+ 
+ 	ibv_ack_cq_events(cq, 1);
+ 	if (ibv_req_notify_cq(cq, 0)) {
+-		logg(LOG_CRIT, "ibv_req_notify_cq: Failed\n");
++		logg(LOG_ERR, "ibv_req_notify_cq: Failed\n");
+ 		abort();
+ 	}
+ 
++	if (!c || c->cq != cq) {
++		logg(LOG_ERR, "Invalid channel in handle_comp_event() %p\n", c);
++		return;
++	}
++
+ 	/* Retrieve completion events and process incoming data */
+-	cqs = ibv_poll_cq(cq, 100, wc);
++	cqs = ibv_poll_cq(cq, max_wc_cqs, wc);
+ 	if (cqs < 0) {
+ 		logg(LOG_WARNING, "CQ polling failed with: %s on %s\n",
+ 			errname(), c->text);
+@@ -5084,7 +5095,7 @@ static void logging(void)
+ 			i->multicast->stats[packets_received],
+ 			i->multicast->stats[packets_sent]);
+ 
+-		if (pgm_mode != pgm_none && i->multicast->stats[pgm_spm])
++		if (pgm_mode != pgm_none && (i->multicast->stats[pgm_spm] || i->multicast->stats[pgm_odata]))
+ 			n+= sprintf(counts + n, " [TSI=%d SPM=%u,ODATA=%u,RDATA=%u,NAK=%u]",
+ 				i->nr_tsi,
+ 				i->multicast->stats[pgm_spm],
+@@ -5367,7 +5378,7 @@ struct enable_option {
+ 	const char *off_value;
+ 	const char *description;
+ } enable_table[] = {
+-{ "buffers",		NULL, &nr_buffers,	"1000000", "10000",	"Number of 8k buffers allocated for packet processing" },
++{ "buffers",		NULL, &nr_buffers,	"200000", "10000",	"Number of 8k buffers allocated for packet processing" },
+ { "bridging",		&bridging, NULL,	"on", "off",	"Forwarding of packets between interfaces" },
+ { "drop",		NULL,	&drop_packets,	"100", "0",	"Drop multicast packets. The value is the number of multicast packets to send before dropping" },
+ { "flow",		&flow_steering, NULL,	"on", "off",	"Enable flow steering to limit the traffic on the RAW sockets [Experimental, Broken]" },

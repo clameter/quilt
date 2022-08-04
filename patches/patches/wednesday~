@@ -1,0 +1,39 @@
+Index: rdma-core/ib2roce/ib2roce.c
+===================================================================
+--- rdma-core.orig/ib2roce/ib2roce.c
++++ rdma-core/ib2roce/ib2roce.c
+@@ -80,7 +80,7 @@
+ #include "ibraw.h"
+ #include "cma-hdr.h"
+ 
+-#define VERSION "2022.0220"
++#define VERSION "2022.0323"
+ 
+ #define MIN(a,b) (((a)<(b))?(a):(b))
+ 
+@@ -1156,7 +1156,7 @@ retry:
+ 		if (coi) {
+ 			coi->cq[channel_nr] = c->cq;
+ 
+-			if (channel_nr == 1) {
++			if (channel_nr == 0) {
+ 				coi->numa_node = c->i->numa_node;
+ 			} else {
+ 				if (coi->numa_node != c->i->numa_node) {
+@@ -1843,7 +1843,7 @@ static bool setup_packet(struct rdma_cha
+ 	};
+ 
+ 	if (i == i2r + INFINIBAND) {
+-		logg(LOG_ERR, "Packet Sockets do not work right on Infiniband");
++		logg(LOG_ERR, "Packet Sockets do not work right on Infiniband\n");
+ 		return false;
+ 	}
+ 
+@@ -4747,6 +4747,7 @@ static void daemonize(void)
+ 
+ 	if (chdir("/var/lib/ib2roce")) {
+ 		perror("chdir");
++		printf("/var/lib/ib2roce must exist and be writeable for daemon mode.\n");
+ 		exit(EXIT_FAILURE);
+ 	}
+ 

@@ -1346,7 +1346,7 @@ Index: rdma-core/ib2roce/logging.h
 ===================================================================
 --- /dev/null
 +++ rdma-core/ib2roce/logging.h
-@@ -0,0 +1,58 @@
+@@ -0,0 +1,56 @@
 +#ifndef IB2ROCE_LOGGING
 +#define IB2ROCE_LOGGING
 +/*
@@ -1400,8 +1400,6 @@ Index: rdma-core/ib2roce/logging.h
 +
 +extern int loglevel;
 +extern bool background;
-+
-+void logging_init(void);
 +
 +#endif
 +

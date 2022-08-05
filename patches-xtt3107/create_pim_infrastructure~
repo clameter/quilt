@@ -60,13 +60,12 @@ Index: rdma-core/ib2roce/pim.c
 +#include "pim.h"
 +#include "errno.h"
 +#include "sched.h"
-+#include "multicast.h"
 +
 +void pim_received(struct mc *m, enum interfaces in, struct buf *buf)
 +{
 +}
 +
-+static void pim_pulse(void *private)
++void pim_pulse(void)
 +{
 +}
 +
@@ -78,24 +77,24 @@ Index: rdma-core/ib2roce/pim.c
 +	m->text = "PIM Protocol Independent Multicast";
 +	m->addr = INADDR_ALL_PIM_ROUTERS;
 +
++	new_mc
 +	add_event(timestamp() + seconds(TIMER_INTERVAL), pim_pulse, NULL, "PIM pulse");
 +}
 Index: rdma-core/ib2roce/pim.h
 ===================================================================
 --- /dev/null
 +++ rdma-core/ib2roce/pim.h
-@@ -0,0 +1,16 @@
+@@ -0,0 +1,15 @@
 +
 +#ifndef IB2ROCE_PIM
 +#define IB2ROCE_PIM
 +
 +#include <stdbool.h>
 +#include "buffers.h"
-+#include "multicast.h"
 +
 +bool pim;
 +
-+void pim_received(struct mc *, enum interfaces, struct buf *buf);
++void pim_received(struct buf *buf);
 +void pim_send(void);
 +void pim_init(void);
 +
@@ -105,10 +104,10 @@ Index: rdma-core/ib2roce/CMakeLists.txt-NO_MSTFLINT
 ===================================================================
 --- rdma-core.orig/ib2roce/CMakeLists.txt-NO_MSTFLINT
 +++ rdma-core/ib2roce/CMakeLists.txt-NO_MSTFLINT
-@@ -14,6 +14,7 @@ rdma_executable(ib2roce
+@@ -13,6 +13,7 @@ rdma_executable(ib2roce
+   locking.c
    buffers.c
    multicast.c
-   interfaces.c
 +  pim.c
  )
  target_link_libraries(ib2roce LINK_PRIVATE

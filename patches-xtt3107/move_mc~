@@ -690,7 +690,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  #ifdef UNICAST
  static bool unicast = false;		/* Bridge unicast packets */
  static bool flow_steering = false;	/* Use flow steering to filter packets */
-@@ -120,54 +121,18 @@ static bool testing = false;		/* Run som
+@@ -120,55 +121,19 @@ static bool testing = false;		/* Run som
  static bool latency = false;		/* Perform Latency tests and provide stats */
  static bool loopback_blocking = true;	/* Ask for loopback blocking on Multicast QPs */
  static int drop_packets = 0;		/* Packet dropper */
@@ -700,6 +700,7 @@ Index: rdma-core/ib2roce/ib2roce.c
 -static int max_rburst = 10;		/* Dont delay until # of packets for ROCE */
 -static int max_iburst = 10;		/* Dont delay until # of packets for Infiniband */
  static int stat_interval = 10;		/* Interval for statistics */
+ static int loglevel = LOG_INFO;		/* LOG level for console output */
  
 -static const char *inet6_ntoa(void *x)
 -{
@@ -745,7 +746,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  struct buf;
  
  typedef void event_callback(void *);
-@@ -202,57 +167,6 @@ struct endpoint {
+@@ -203,57 +168,6 @@ struct endpoint {
  	struct forward *forwards;
  };
  
@@ -803,7 +804,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  #ifdef UNICAST
  /*
   * A Unicastconnection to a certain port and host with
-@@ -272,496 +186,14 @@ struct rdma_unicast {
+@@ -273,496 +187,14 @@ struct rdma_unicast {
  #endif
  
  
@@ -1300,7 +1301,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  static void beacon_received(struct mc *, enum interfaces, struct buf *buf);
  
  #ifdef UNICAST
-@@ -958,7 +390,6 @@ err:
+@@ -959,7 +391,6 @@ err:
  	return NULL;
  }
  
@@ -1308,7 +1309,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  static void arm_channels(struct core_info *core);
  
  /*
-@@ -1862,62 +1293,6 @@ static void shutdown_roce(void)
+@@ -1863,62 +1294,6 @@ static void shutdown_roce(void)
  	qp_destroy(i2r + ROCE);
  }
  
@@ -1371,7 +1372,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  #ifdef UNICAST
  static void resolve_start(struct rdma_unicast *);
  
-@@ -1995,254 +1370,6 @@ static void resolve(struct rdma_unicast
+@@ -1996,254 +1371,6 @@ static void resolve(struct rdma_unicast
  }
  #endif
  
@@ -1626,7 +1627,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  #ifdef UNICAST
  static struct rdma_unicast *new_rdma_unicast(struct i2r_interface *i, struct sockaddr_in *sin)
  {
-@@ -3299,15 +2426,10 @@ static void receive_multicast(struct buf
+@@ -3300,15 +2427,10 @@ static void receive_multicast(struct buf
  		unsigned char *mgid = buf->grh.dgid.raw;
  		unsigned short signature = ntohs(*(unsigned short*)(mgid + 2));
  
@@ -1646,7 +1647,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  		}
  
  	}
-@@ -4191,117 +3313,6 @@ discard:
+@@ -4192,117 +3314,6 @@ discard:
  }
  #endif
  
@@ -1764,7 +1765,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  #ifdef UNICAST
  /* Special handling using raw socket */
  static void handle_receive_packet(void *private)
-@@ -4353,27 +3364,6 @@ static void handle_receive_packet(void *
+@@ -4354,27 +3365,6 @@ static void handle_receive_packet(void *
  }
  #endif
  
@@ -1792,7 +1793,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  static int status_fd;
  
  static int channel_stats(char *b, struct rdma_channel *c, const char *interface, const char *type)
-@@ -4431,7 +3421,7 @@ static unsigned show_multicast(char *b)
+@@ -4432,7 +3422,7 @@ static unsigned show_multicast(char *b)
  			inet_ntoa(m->addr),
  			mc_text[m->interface[INFINIBAND].status],
  			m->interface[INFINIBAND].sendonly ? "Sendonly " : "",
@@ -1801,7 +1802,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  			m->interface[INFINIBAND].pending,
  			mc_text[m->interface[ROCE].status],
  			m->interface[ROCE].sendonly ? "Sendonly" : "",
-@@ -5187,7 +4177,6 @@ skip:
+@@ -5188,7 +4178,6 @@ skip:
  static void exec_opt(int op, char *optarg)
  {
  	int ret = 0;
@@ -1809,7 +1810,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  
  	switch (op) {
  		case 'b':
-@@ -5220,20 +4209,11 @@ static void exec_opt(int op, char *optar
+@@ -5221,20 +4210,11 @@ static void exec_opt(int op, char *optar
  
  		case 'l':
  			if (optarg) {
@@ -1833,7 +1834,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  			exit(1);
  			break;
  
-@@ -5464,7 +4444,7 @@ static void multicast_cmd(char *paramete
+@@ -5465,7 +4445,7 @@ static void multicast_cmd(char *paramete
  				interfaces_text[in], m->text,
  			mc_text[m->interface[in].status],
  			m->interface[in].sendonly ? "Sendonly " : "",
@@ -1842,7 +1843,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  			m->interface[in].packet_time,
  			m->interface[in].max_burst,
  			m->interface[in].delayed,
-@@ -5767,7 +4747,7 @@ int main(int argc, char **argv)
+@@ -5768,7 +4748,7 @@ int main(int argc, char **argv)
  {
  	int op, ret = 0;
  
@@ -1851,7 +1852,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  
  #ifdef UNICAST
  	sidr_state_init();
-@@ -5800,7 +4780,7 @@ int main(int argc, char **argv)
+@@ -5801,7 +4781,7 @@ int main(int argc, char **argv)
  	logg (LOG_NOTICE, "%s device = %s:%d, %s device = %s:%d. Multicast Groups=%d MGIDs=%s Buffers=%u\n",
  			interfaces_text[INFINIBAND], i2r[INFINIBAND].rdma_name, i2r[INFINIBAND].port,
  			interfaces_text[ROCE], i2r[ROCE].rdma_name, i2r[ROCE].port,

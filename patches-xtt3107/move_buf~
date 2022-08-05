@@ -709,7 +709,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  
  #include "ibraw.h"
  #include "cma-hdr.h"
-@@ -252,17 +253,6 @@ static struct i2r_interface {
+@@ -253,17 +254,6 @@ static struct i2r_interface {
  	struct hash *pgm_record_hash;
  } i2r[NR_INTERFACES];
  
@@ -727,7 +727,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  #ifdef UNICAST
  /*
   * A Unicastconnection to a certain port and host with
-@@ -772,217 +762,12 @@ static int leave_mc(enum interfaces i)
+@@ -773,217 +763,12 @@ static int leave_mc(enum interfaces i)
  	return 0;
  }
  
@@ -945,7 +945,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  typedef bool setup_callback(struct rdma_channel *c);
  static receive_callback receive_multicast;
  #ifdef UNICAST
-@@ -2458,258 +2243,7 @@ err:
+@@ -2459,258 +2244,7 @@ err:
  #endif
  }
  
@@ -1204,7 +1204,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  static struct rdma_unicast *new_rdma_unicast(struct i2r_interface *i, struct sockaddr_in *sin)
  {
  	struct rdma_unicast *ra = calloc(1, sizeof(struct rdma_unicast));
-@@ -2783,8 +2317,6 @@ static void unicast_packet(struct rdma_c
+@@ -2784,8 +2318,6 @@ static void unicast_packet(struct rdma_c
  
  	dump_buf_grh(buf);
  }
@@ -1213,7 +1213,7 @@ Index: rdma-core/ib2roce/ib2roce.c
  #endif
  
  static void list_endpoints(struct i2r_interface *i)
-@@ -6270,7 +5802,10 @@ int main(int argc, char **argv)
+@@ -6271,7 +5803,10 @@ int main(int argc, char **argv)
  			interfaces_text[ROCE], i2r[ROCE].rdma_name, i2r[ROCE].port,
  			nr_mc, mgid_mode->id, nr_buffers);
  

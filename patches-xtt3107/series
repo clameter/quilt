@@ -6,6 +6,8 @@ move_sched
 move_lock
 move_buf
 move_mc
+beacon
+cli
 create_pim_infrastructure
 traff_class_instead
 raw

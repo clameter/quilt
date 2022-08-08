@@ -1,0 +1,18 @@
+Index: rdma-core/ib2roce/ib2roce.c
+===================================================================
+--- rdma-core.orig/ib2roce/ib2roce.c
++++ rdma-core/ib2roce/ib2roce.c
+@@ -2520,9 +2520,13 @@ static void handle_rdma_event(void *priv
+ 
+ 				a->remote_qpn = param->qp_num;
+ 				a->remote_qkey = param->qkey;
++
+ 				if (rate)
+ 					param->ah_attr.static_rate = rate;
+ 
++				if (m->tos_mode)
++					param->ah_attr.grh.traffic_class = m->tos_mode;
++
+ 				a->ah = ibv_create_ah(i->multicast->pd, &param->ah_attr);
+ 				if (!a->ah) {
+ 					logg(LOG_ERR, "Failed to create AH for Multicast group %s on %s \n",

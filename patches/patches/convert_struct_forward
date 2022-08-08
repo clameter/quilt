@@ -1,0 +1,178 @@
+Index: rdma-core/ib2roce/ib2roce.c
+===================================================================
+--- rdma-core.orig/ib2roce/ib2roce.c
++++ rdma-core/ib2roce/ib2roce.c
+@@ -307,18 +307,6 @@ struct rdma_channel {
+ };
+ 
+ /*
+- * The forwarding struct describes the forwarding for datagrams
+- * coming from a source QP to another QP at an endpoint.
+- * This is singly linked list attache to the endpoints
+- */
+-struct forward {
+-	struct endpoint *dest;
+-	struct forward *next;
+-	uint32_t source_qp, dest_qp;
+-	uint32_t dest_qkey;
+-};
+-
+-/*
+  * Address information for an endpoint.
+  * ah points to the address stucture needed to send data to
+  * this endpoint. The rest are basically keys to lookup
+@@ -347,6 +335,18 @@ struct dest {
+ 	uint32_t remote_qkey;
+ };
+ 
++/*
++ * The forwarding struct describes the forwarding for datagrams
++ * coming from a source QP to another QP at an endpoint.
++ * This is singly linked list attache to the endpoints
++ */
++struct forward {
++	struct dest dest;
++	uint32_t source_qp;
++	struct forward *next;
++};
++
++
+ static inline void setup_dest(struct dest *d, struct endpoint *ep, uint32_t remote_qpn, uint32_t remote_qkey)
+ {
+ 	d->ep = ep;
+@@ -2635,7 +2635,7 @@ static int send_inline(struct rdma_chann
+ /*
+  * Send data to target using native RDMA structs relying on state in struct buf.
+  */
+-static int send_ud(struct rdma_channel *c, struct buf *buf, struct ibv_ah *ah, uint32_t remote_qpn, uint32_t qkey)
++static int send_ud(struct rdma_channel *c, struct buf *buf, struct dest *dest)
+ {
+ 	struct ibv_send_wr wr, *bad_send_wr;
+ 	struct ibv_sge sge;
+@@ -2654,9 +2654,9 @@ static int send_ud(struct rdma_channel *
+ 	wr.wr_id = (uint64_t)buf;
+ 
+ 	/* Get addr info  */
+-	wr.wr.ud.ah = ah;
+-	wr.wr.ud.remote_qpn = remote_qpn;
+-	wr.wr.ud.remote_qkey = qkey;
++	wr.wr.ud.ah = dest->ep->ah;
++	wr.wr.ud.remote_qpn = dest->remote_qpn;
++	wr.wr.ud.remote_qkey = dest->remote_qkey;
+ 
+ 	sge.length = buf->end - buf->cur;
+ 	sge.lkey = c->mr->lkey;
+@@ -2941,7 +2941,7 @@ static void list_endpoints(struct i2r_in
+ 
+ 				while (f) {
+ 					n += snprintf(buf + n, sizeof(buf) - n, "[0x%x->%s:%x/%x]",
+-						f->source_qp, inet_ntoa(f->dest->addr), f->dest_qp, f->dest_qkey);
++						f->source_qp, inet_ntoa(f->dest.ep->addr), f->dest.remote_qpn, f->dest.remote_qkey);
+ 
+ 					f = f->next;
+ 				}
+@@ -2961,13 +2961,11 @@ static void list_endpoints(struct i2r_in
+  * This function only adds the forward. Check if there is an existing
+  * forward before calling this function.
+  */
+-static void add_forward(struct endpoint *source, uint32_t source_qp, struct endpoint *dest, uint32_t dest_qp, uint32_t qkey)
++static void add_forward(struct endpoint *source, uint32_t source_qp, struct dest *dest)
+ {
+ 	struct forward *f = calloc(1, sizeof(struct forward));
+ 
+-	f->dest = dest;
+-	f->dest_qp = dest_qp;
+-	f->dest_qkey = qkey;
++	f->dest = *dest;
+ 	f->source_qp = source_qp;
+ 
+ 	f->next = source->forwards;
+@@ -2981,11 +2979,11 @@ static void add_forward(struct endpoint
+  *
+  * source_qp = 0 indicated that the source_qp is not known yet.
+  */
+-static struct forward *find_forward(struct endpoint *source, struct endpoint *dest, uint32_t source_qp)
++static struct forward *find_forward(struct endpoint *source, struct endpoint *ep, uint32_t source_qp)
+ {
+ 	struct forward *f = source->forwards;
+ 
+-	while (f && f->source_qp != source_qp && (!dest || f->dest == dest))
++	while (f && f->source_qp != source_qp && (!ep || f->dest.ep == ep))
+ 		f = f->next;
+ 
+ 	return f;
+@@ -4199,10 +4197,11 @@ static void sidr_state_init(void)
+  */
+ static void send_mad(struct endpoint *e, struct buf *buf, void *mad_pos)
+ {
++	struct dest d = { e, 1, IB_DEFAULT_QP1_QKEY };
+ 	buf->cur = mad_pos;
+ 	buf->end = mad_pos + 256;
+ 
+-	send_ud(e->i->qp1, buf, e->ah, 1, IB_DEFAULT_QP1_QKEY);
++	send_ud(e->i->qp1, buf, &d);
+ }
+ 
+ static const char *sidr_req(struct buf *buf, void *mad_pos)
+@@ -4387,11 +4386,18 @@ static const char * sidr_rep(struct buf
+ 		return "Ignoring SIDR REQ since one is already pending";
+ 	}
+ 
+-	add_forward(ss->source, ss->source_qp, ss->dest, sr_qpn, sr_qkey);
++	{
++		struct dest dest = { ss->dest, sr_qpn, sr_qkey };
++
++		add_forward(ss->source, ss->source_qp, &dest);
++	}
++
++	if (ss->source_qp) {
++		struct dest source = { ss->source, ss->source_qp, sr_qkey };
+ 
+-	if (ss->source_qp)
+ 		/* Add the reverse forward if we have the source_qp number */
+-		add_forward(ss->dest, sr_qpn, ss->source, ss->source_qp, sr_qkey);
++		add_forward(ss->dest, sr_qpn, &source);
++	}
+ 
+ 	unlock();
+ 
+@@ -4694,11 +4700,13 @@ static void receive_ud(struct buf *buf)
+ 		/* Hmm... Not good. Maybe there is a wild chart entry if the source_qp was not determined yet */
+ 		f = find_forward(e, d, 0);
+ 		if (f) {
++			struct dest ford = { e, f->source_qp, f->dest.remote_qkey};
++
+ 			f->source_qp = w->src_qp;
+ 			logg(LOG_NOTICE, "Inserted QP#%x into forwarding entry for %s\n", w->src_qp, inet_ntoa(e->addr));
+ 
+ 			/* And add the missing reverse forward */
+-			add_forward(f->dest, f->dest_qp, e, f->source_qp, f->dest_qkey); 
++			add_forward(f->dest.ep, f->dest.remote_qpn, &ford); 
+ 		}
+ 
+ 		unlock();
+@@ -4714,12 +4722,12 @@ static void receive_ud(struct buf *buf)
+ 	 * if the value in immm matches the src_qp.... Maybe we should not do this by default ?
+ 	 */
+ 	if (ntohl(buf->imm) == w->src_qp)
+-		buf->imm = htonl(f->dest->i->ud->qp->qp_num);
++		buf->imm = htonl(f->dest.ep->i->ud->qp->qp_num);
+ 
+ 	logg(LOG_NOTICE, "receive_ud %s Packet len=%u 0x%x lid=%d forwarded to %s %s:0x%x lid=%d qkey=%x\n", c->text,
+-			w->byte_len, w->src_qp, e->lid, dest_i->ud->text, inet_ntoa(f->dest->addr), f->dest_qp, f->dest->lid, f->dest_qkey);
++			w->byte_len, w->src_qp, e->lid, dest_i->ud->text, inet_ntoa(f->dest.ep->addr), f->dest.remote_qpn, f->dest.ep->lid, f->dest.remote_qkey);
+ 
+-	send_ud(dest_i->ud, buf, f->dest->ah, f->dest_qp, f->dest_qkey);
++	send_ud(dest_i->ud, buf, &f->dest);
+  	return;
+  
+ discard:
+@@ -5063,7 +5071,7 @@ static unsigned show_endpoints(char *b)
+ 
+ 				for (f = ep->forwards; f; f = f->next) {
+ 					n += snprintf(b + n, sizeof(buf) - n, " Q%d->%sQ%d",
+-					      f->source_qp, inet_ntoa(f->dest->addr), f->dest_qp);
++					      f->source_qp, inet_ntoa(f->dest.ep->addr), f->dest.remote_qpn);
+ 				}
+ 			}
+ 			offset += 20;

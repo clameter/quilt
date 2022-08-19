@@ -14,7 +14,7 @@ Index: rdma-core/ib2roce/buffers.c
 ===================================================================
 --- /dev/null
 +++ rdma-core/ib2roce/buffers.c
-@@ -0,0 +1,482 @@
+@@ -0,0 +1,481 @@
 +/*
 + * RDMA Infiniband to ROCE Bridge or Gateway
 + *
@@ -91,8 +91,7 @@ Index: rdma-core/ib2roce/buffers.c
 +int nr_buffers = 100000;
 +bool huge = false;
 +
-+struct buf *buffers;
-+struct buf *nextbuffer;
++#define MAX_INLINE_DATA 64
 +
 +#ifdef UNICAST
 +static int send_buf(struct buf *buf, struct rdma_unicast *ra);
@@ -501,7 +500,7 @@ Index: rdma-core/ib2roce/buffers.h
 ===================================================================
 --- /dev/null
 +++ rdma-core/ib2roce/buffers.h
-@@ -0,0 +1,195 @@
+@@ -0,0 +1,192 @@
 +#ifndef IB2ROCE_BUFFERS
 +#define IB2ROCE_BUFFERS
 +
@@ -586,9 +585,6 @@ Index: rdma-core/ib2roce/buffers.h
 +#define BUFFER_SIZE 8192
 +#define META_SIZE 1024
 +#define DATA_SIZE (BUFFER_SIZE - META_SIZE)
-+
-+#define MAX_INLINE_DATA 64
-+
 +/*
 + * Buf is page aligned and contains 2 pages. The layout attempts to put critical components
 + * at page boundaries
@@ -637,9 +633,9 @@ Index: rdma-core/ib2roce/buffers.h
 +static int send_buf(struct buf *buf, struct rdma_unicast *ra);
 +#endif
 +
-+extern struct buf *buffers;
++struct buf *buffers;
 +
-+extern struct buf *nextbuffer;	/* Pointer to next available RDMA buffer */
++struct buf *nextbuffer;	/* Pointer to next available RDMA buffer */
 +
 +struct buf *alloc_buffer(struct rdma_channel *c);
 +void free_buffer(struct buf *buf);

@@ -2,7 +2,7 @@ Index: rdma-core/ib2roce/pim.c
 ===================================================================
 --- /dev/null
 +++ rdma-core/ib2roce/pim.c
-@@ -0,0 +1,77 @@
+@@ -0,0 +1,178 @@
 +
 +/*
 + * PIM handling for IB2ROCE
@@ -46,13 +46,10 @@ Index: rdma-core/ib2roce/pim.c
 +#include <stdio.h>
 +#include <stdlib.h>
 +#include <stdbool.h>
-+#include <stdarg.h>
 +#include <sys/types.h>
 +#include <sys/stat.h>
-+#include <sys/mman.h>
 +#include <string.h>
 +#include <time.h>
-+#include <errno.h>
 +#include <stdint.h>
 +
 +#include "pimdd.h"
@@ -60,26 +57,130 @@ Index: rdma-core/ib2roce/pim.c
 +#include "pim.h"
 +#include "errno.h"
 +#include "sched.h"
-+#include "multicast.h"
++#include "interfaces.h"
++#include "cli.h"
 +
-+void pim_received(struct mc *m, enum interfaces in, struct buf *buf)
++bool pim = false;
++
++int pim_socket;
++
++
++static struct sockaddr_in pim_group = {
++	.sin_family = AF_INET,
++/*	This is not working so the assignment is in the module initialization
++  .sin_addr = { .s_addr = htonl(INADDR_ALL_PIM_ROUTERS)
++		} */
++};
++
++/*
++ * PIM Processing
++ */
++struct pim_info {
++	unsigned long signature;
++	char version[10];
++	bool infiniband;
++	uint16_t beacon_port;
++	struct in_addr beacon_mc;
++	uint64_t t;
++	unsigned gateway_qp;
++	struct in_addr bridge_addr;		/* Where is the local bridge */
++	struct in_addr to_addr;			/* To which address is it bridging */
++	unsigned nr_mc;				/* Active Multicast */
++	unsigned nr_tsi;			/* Active TSIs */
++};
++
++static void pim_receive(void *private)
 +{
++	struct sockaddr addr;
++	socklen_t addrlen;
++	uint8_t message[1500];
++	int bytes;
++
++	bytes = recvfrom(pim_socket, message, sizeof(message), 0 , &addr, &addrlen);
++	if (bytes > 0) {
++		logg(LOG_ERR, "pim_receive: recvfrom error: %s", errname());
++		return;
++	}
++
++	/* Identify interface from addr */
++
++	/* Handle message */
 +}
 +
-+static void pim_pulse(void *private)
++static void pim_send_hello(void *private)
 +{
++	int in;
++	int bytes;
++	uint8_t message[1500];
++
++	/* Send PIM via socket */
++
++	for(in = 0; in < NR_INTERFACES; in++) {
++		struct i2r_interface *i = i2r + in;
++		unsigned len;
++
++		len = 4711;
++//		prep_beacon_struct(i, &b);
++//		b.t = now = timestamp();
++
++ 		if (setsockopt(pim_socket, IPPROTO_IP, IP_MULTICAST_IF, &i->if_addr.sin_addr, sizeof(i->if_addr.sin_addr)) < 0)
++			logg(LOG_ERR, "setsockopt IP_MULTICAST_IF %s: %s", inet_ntoa(i->if_addr.sin_addr), errname());
++
++		bytes = sendto(pim_socket, message, len, 0, (struct sockaddr *)&pim_group, sizeof(pim_group));
++		if (bytes < 0)
++			logg(LOG_ERR, "sendto: %s", errname());
++
++	}
++	add_event(timestamp() + seconds(10), pim_send_hello, NULL, "Send PIM Hello");
 +}
 +
-+void pim_init(void)
++void pim_setup(void)
 +{
-+	struct mc *m = new_mc();
++	int i;
 +
-+	m->callback  = pim_received;
-+	m->text = "PIM Protocol Independent Multicast";
-+	m->addr = INADDR_ALL_PIM_ROUTERS;
 +
-+	add_event(timestamp() + seconds(TIMER_INTERVAL), pim_pulse, NULL, "PIM pulse");
++	if (!pim)
++		return;
++
++	pim_socket = socket(AF_INET, SOCK_DGRAM, 0);
++
++	if (pim_socket < 0) {
++		logg(LOG_ERR, "Cannot open UDP socket %s", errname());
++		return;
++	}
++
++	/* Join pim multicast group for each interface */
++	for(i = 0; i < NR_INTERFACES; i++ ) {
++		struct i2r_interface *ifa = i2r + i;
++		struct ip_mreqn mreq = {
++			.imr_multiaddr = pim_group.sin_addr,
++			.imr_address = ifa->if_addr.sin_addr,
++			.imr_ifindex = ifa->ifindex
++		};
++
++ 		if (setsockopt(pim_socket, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq)) < 0)
++			logg(LOG_ERR,  "Cannot join group %s on interface %s: %s", inet_ntoa(pim_group.sin_addr), ifa->text, errname());
++	}
++
++	/* listen to pim socket */
++	register_callback(pim_receive, pim_socket, NULL);
++
++	pim_send_hello(NULL);
 +}
++
++static void pim_cli_on(char *optarg)
++{
++	pim = true;
++}
++
++__attribute__((constructor))
++static void pim_init(void) {
++
++	pim_group.sin_addr.s_addr = htonl(INADDR_ALL_PIM_ROUTERS);
++
++	register_option("pim", optional_argument, 'p', pim_cli_on, NULL, "Activate PIM Protocol");
++}
++
 Index: rdma-core/ib2roce/pim.h
 ===================================================================
 --- /dev/null
@@ -97,7 +198,7 @@ Index: rdma-core/ib2roce/pim.h
 +
 +void pim_received(struct mc *, enum interfaces, struct buf *buf);
 +void pim_send(void);
-+void pim_init(void);
++void pim_setup(void);
 +
 +#endif
 +
@@ -105,10 +206,10 @@ Index: rdma-core/ib2roce/CMakeLists.txt-NO_MSTFLINT
 ===================================================================
 --- rdma-core.orig/ib2roce/CMakeLists.txt-NO_MSTFLINT
 +++ rdma-core/ib2roce/CMakeLists.txt-NO_MSTFLINT
-@@ -14,6 +14,7 @@ rdma_executable(ib2roce
-   buffers.c
-   multicast.c
-   interfaces.c
+@@ -18,6 +18,7 @@ rdma_executable(ib2roce
+   cli.c
+   endpoint.c
+   pgm.c
 +  pim.c
  )
  target_link_libraries(ib2roce LINK_PRIVATE

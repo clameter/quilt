@@ -495,7 +495,7 @@ Index: rdma-core/ib2roce/multicast.h
 ===================================================================
 --- /dev/null
 +++ rdma-core/ib2roce/multicast.h
-@@ -0,0 +1,167 @@
+@@ -0,0 +1,168 @@
 +#ifndef IB2ROCE_MULTICAST
 +#define IB2ROCE_MULTICAST
 +/*
@@ -572,6 +572,7 @@ Index: rdma-core/ib2roce/multicast.h
 +#include <infiniband/umad_cm.h>
 +#include <infiniband/umad_str.h>
 +#include "errno.h"
++#include "ib_hdrs.h"
 +#include "fifo.h"
 +#include "ring.h"
 +#include "hash.h"
@@ -1878,7 +1879,7 @@ Index: rdma-core/ib2roce/interfaces.c
 ===================================================================
 --- /dev/null
 +++ rdma-core/ib2roce/interfaces.c
-@@ -0,0 +1,696 @@
+@@ -0,0 +1,651 @@
 +/*
 + * RDMA Interfaces
 + *
@@ -2417,51 +2418,6 @@ Index: rdma-core/ib2roce/interfaces.c
 +	terminate(0);
 +
 +        ibv_ack_async_event(&event);
-+}
-+
-+/*
-+ * Handling of RDMA work requests
-+ */
-+static void post_receive(struct rdma_channel *c)
-+{
-+	struct ibv_recv_wr recv_wr, *recv_failure;
-+	struct ibv_sge sge;
-+	int ret = 0;
-+
-+	if (!c || !nextbuffer)
-+		return;
-+
-+	if (c->active_receive_buffers >= c->nr_receive)
-+		return;
-+
-+	recv_wr.next = NULL;
-+	recv_wr.sg_list = &sge;
-+	recv_wr.num_sge = 1;
-+
-+	sge.length = DATA_SIZE;
-+	sge.lkey = c->mr->lkey;
-+
-+	while (c->active_receive_buffers < c->nr_receive) {
-+
-+		struct buf *buf = alloc_buffer(c);
-+
-+		if (!buf) {
-+			logg(LOG_WARNING, "%s: No free buffers left\n", c->text);
-+			return;
-+		}
-+
-+		/* Use the buffer address for the completion handler */
-+		recv_wr.wr_id = (uint64_t)buf;
-+		sge.addr = (uint64_t)buf->raw;
-+		ret = ibv_post_recv(c->qp, &recv_wr, &recv_failure);
-+		if (ret) {
-+			free_buffer(buf);
-+			errno = ret;
-+			logg(LOG_ERR, "ibv_post_recv failed: %s:%s\n", c->text, errname());
-+			return;
-+                }
-+		c->active_receive_buffers++;
-+	}
 +}
 +
 +static void reset_flags(struct buf *buf)

@@ -2,7 +2,7 @@ Index: rdma-core/ib2roce/pim.c
 ===================================================================
 --- /dev/null
 +++ rdma-core/ib2roce/pim.c
-@@ -0,0 +1,201 @@
+@@ -0,0 +1,178 @@
 +
 +/*
 + * PIM handling for IB2ROCE
@@ -52,22 +52,25 @@ Index: rdma-core/ib2roce/pim.c
 +#include <time.h>
 +#include <stdint.h>
 +
++#include "pimdd.h"
++
++#include "pim.h"
 +#include "errno.h"
 +#include "sched.h"
 +#include "interfaces.h"
 +#include "cli.h"
 +
-+/* This is basically our own form of PIM roughtly following RFC 3973 */
 +bool pim = false;
 +
 +int pim_socket;
 +
-+#define PIM_PORT 1109
-+#define PIM_ADDR "239.1.2.3"
 +
-+#define SIGNAT 0xdeadbeef
-+
-+enum packet_type { PIM_HELLO, PIM_JOIN_PRUNE };
++static struct sockaddr_in pim_group = {
++	.sin_family = AF_INET,
++/*	This is not working so the assignment is in the module initialization
++  .sin_addr = { .s_addr = htonl(INADDR_ALL_PIM_ROUTERS)
++		} */
++};
 +
 +/*
 + * PIM Processing
@@ -75,41 +78,15 @@ Index: rdma-core/ib2roce/pim.c
 +struct pim_info {
 +	unsigned long signature;
 +	char version[10];
-+	enum packet_type type;
-+	struct in_addr bridge;
-+	unsigned hold_time;	/* In Milliseconds */
-+	unsigned state_refresh_interval;	/* In Milliseconds */
-+	unsigned generation_id;	/* Identify State changes on bridge */
-+
-+	/* Bridge state */
++	bool infiniband;
++	uint16_t beacon_port;
++	struct in_addr beacon_mc;
 +	uint64_t t;
++	unsigned gateway_qp;
 +	struct in_addr bridge_addr;		/* Where is the local bridge */
 +	struct in_addr to_addr;			/* To which address is it bridging */
 +	unsigned nr_mc;				/* Active Multicast */
 +	unsigned nr_tsi;			/* Active TSIs */
-+
-+	/* struct pim_jp may follow if packet_type = PIM_JOIN_PRUNE */
-+};
-+
-+/* A single multicast address in the JP message */
-+struct pim_jp_multicast {
-+	unsigned group;
-+	unsigned joined;
-+	unsigned pruned;
-+	unsigned source[];
-+};
-+
-+struct pim_jp {
-+	unsigned bridge;
-+	unsigned number_groups;
-+	unsigned hold_time;	/* In Milliseconds */
-+};
-+
-+static struct sockaddr_in pim_group = {
-+	.sin_family = AF_INET,
-+/*	This is not working so the assignment is in the module initialization
-+  .sin_addr = { .s_addr = htonl(INADDR_ALL_PIM_ROUTERS)
-+		} */
 +};
 +
 +static void pim_receive(void *private)

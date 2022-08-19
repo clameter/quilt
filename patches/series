@@ -1,11 +1,5 @@
-restruct_mc_packet_checks.
-consolidate_code_for_packet_check
-check_reverse_path
-callback_for_beacon
-move_sched
-move_lock
-move_buf
-move_mc
+#fix_help
+make_beacon_pim
 create_pim_infrastructure
 traff_class_instead
 raw

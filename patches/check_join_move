@@ -1,0 +1,94 @@
+Index: rdma-core/ib2roce/ib2roce.c
+===================================================================
+--- rdma-core.orig/ib2roce/ib2roce.c
++++ rdma-core/ib2roce/ib2roce.c
+@@ -1365,31 +1365,6 @@ static void send_buf_to(struct i2r_inter
+ }
+ #endif
+ 
+-static void check_joins(void *private)
+-{
+-	struct i2r_interface *i;
+-
+-	/* Maintenance tasks */
+-	if (nr_mc > active_mc) {
+-		join_processing();
+-		add_event(timestamp() + ONE_SECOND, check_joins, NULL, "Check Multicast Joins");
+-	} else {
+-		/*
+-		 * All active so start listening. This means we no longer
+-		 * are able to subscribe to Multicast groups
+-		 */
+-		for(i = i2r; i < i2r + NR_INTERFACES; i++)
+-		   if (i->context)	{
+-			struct rdma_channel *c = i->multicast;
+-
+-			if (rdma_listen(c->id, 50))
+-				logg(LOG_ERR, "rdma_listen on %s error %s\n", c->text, errname());
+-
+-			c->listening = true;
+-		}
+-	}
+-}
+-
+ static void calculate_pps_channel(struct rdma_channel *c)
+ {
+ 	if (c->last_snapshot) {
+Index: rdma-core/ib2roce/multicast.c
+===================================================================
+--- rdma-core.orig/ib2roce/multicast.c
++++ rdma-core/ib2roce/multicast.c
+@@ -413,7 +413,7 @@ int leave_mc(enum interfaces i)
+  * Join MC groups. This is called from the event loop every second
+  * as long as there are unjoined groups
+  */
+-void join_processing(void)
++static void join_processing(void)
+ {
+ 	int i;
+ 	enum interfaces in;
+@@ -466,6 +466,31 @@ void join_processing(void)
+ }
+ 
+ 
++void check_joins(void *private)
++{
++	struct i2r_interface *i;
++
++	/* Maintenance tasks */
++	if (nr_mc > active_mc) {
++		join_processing();
++		add_event(timestamp() + ONE_SECOND, check_joins, NULL, "Check Multicast Joins");
++	} else {
++		/*
++		 * All active so start listening. This means we no longer
++		 * are able to subscribe to Multicast groups
++		 */
++		for(i = i2r; i < i2r + NR_INTERFACES; i++)
++		   if (i->context)	{
++			struct rdma_channel *c = i->multicast;
++
++			if (rdma_listen(c->id, 50))
++				logg(LOG_ERR, "rdma_listen on %s error %s\n", c->text, errname());
++
++			c->listening = true;
++		}
++	}
++}
++
+ static void multicast_cmd(char *parameters)
+ {
+ 	struct mc *m;
+Index: rdma-core/ib2roce/multicast.h
+===================================================================
+--- rdma-core.orig/ib2roce/multicast.h
++++ rdma-core/ib2roce/multicast.h
+@@ -120,7 +120,7 @@ int _leave_mc(struct in_addr addr,struct
+ 
+ int leave_mc(enum interfaces i);
+ 
+-void join_processing(void);
++void check_joins(void *);
+ 
+ struct sockaddr_in *parse_addr(const char *arg, int port,
+ 	struct mgid_signature **p_mgid_mode, uint8_t *p_tos_mode, bool mc_only);

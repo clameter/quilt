@@ -2,7 +2,12 @@ Index: rdma-core/ib2roce/beacon.c
 ===================================================================
 --- rdma-core.orig/ib2roce/beacon.c
 +++ rdma-core/ib2roce/beacon.c
-@@ -41,10 +41,12 @@
+@@ -38,13 +38,19 @@
+ #include "multicast.h"
+ #include "cli.h"
+ 
++#include <unistd.h>
++
  #include "beacon.h"
  
  #define BEACON_SIGNATURE 0xD3ADB33F
@@ -10,40 +15,26 @@ Index: rdma-core/ib2roce/beacon.c
 +#define BEACON_PORT	1109
  
 -static bool beacon = false;		/* Announce our presence (and possibly coordinate between multiple instances in the future */
--
--const char *beacon_arg = NULL;
 +static bool beacon = false;
-+int beacon_interval = 1000;	/* Default Hello interval in Milliseconds */
-+unsigned sessionid;		/* Random Number for this session */
++static int beacon_interval = 1000;	/* Default Hello interval in Milliseconds */
++static unsigned sessionid;		/* Random Number for this session */
+ 
+-const char *beacon_arg = NULL;
++static char hostname[40];
  
  #define BEACON_MCS 500
  
-@@ -54,52 +56,118 @@ struct beacon_mc {
+@@ -53,53 +59,136 @@ struct beacon_mc {
+ 	uint16_t port;
  };
  
- /*
+-/*
 - * Beacon processing
-+ * Multicast state in the beacon packet
-+ */
-+struct beacon_multicast {
-+	struct in_addr group;
-+	bool sendonly[2];
-+	uint8_t tos_mode;
-+	uint8_t mgid_mode;
-+	uint16_t port;
-+};
-+
-+/*
-+ * Beacon info
-  */
- struct beacon_info {
- 	unsigned long signature;
- 	char version[10];
-+	unsigned sessionid;
-+	unsigned hold_time;		/* Validity of the Beacon Info */
-+	unsigned sqn;
-+	uint64_t timestamp;
- 	bool infiniband;
+- */
+-struct beacon_info {
+-	unsigned long signature;
+-	char version[10];
+-	bool infiniband;
 -	uint16_t beacon_port;
 -	struct in_addr beacon_mc;
 -	uint64_t t;
@@ -53,48 +44,74 @@ Index: rdma-core/ib2roce/beacon.c
 -	unsigned nr_mc;				/* Active Multicast */
 -	unsigned nr_tsi;			/* Active TSIs */
 -	struct beacon_mc mc[500];
-+	struct in_addr addr[2];		/* Addresses of the bridge */
-+	unsigned nr_mc;			/* Active Multicast */
-+	unsigned nr_tsi;		/* Active TSIs */
-+	struct beacon_multicast mc[];	/* nr_mc beacon_jp_multicast instances follow */
- };
- 
-+/*
-+ * Remote bridge states: This is controlled by the beacons that will refresh
-+ * the expiration time. If the expiration occurs then the bridge will take subscribe
-+ * to all the multicast groups of that bridge.
-+ * If a new beacon is encoutered from that bridge then there will be an unsubscribe.
-+ */
-+struct bridge_state {
-+	unsigned long expiration;
-+	bool active;
-+	struct in_addr origin[2];
-+	unsigned beacons_missed;
-+	unsigned beacons_received;
-+	struct beacon_info last;
-+};
-+
+-};
 +#define MAX_BRIDGES 10
 +static struct bridge_state remote_bridge[MAX_BRIDGES];
 +
 +static unsigned int nr_bridges;
-+
+ 
  static struct mc *beacon_mc;		/* == NULL if unicast */
  static struct sockaddr_in *beacon_sin;
  
 -static void prep_beacon_struct(struct i2r_interface *i, struct beacon_info *b)
 +static void enable_bridge(struct bridge_state *b)
 +{
++	struct beacon_multicast *bm;
++	int nr_mcs;
++
 +	logg(LOG_INFO, "Taking over for bridge on %s\n", inet_ntoa(b->origin[0]));
 +
++	nr_mcs = b->last.nr_mc;
++
 +	/* Subscribe to all MC groups of the specified group */
++	for(bm = b->last.mc; bm < b->last.mc + nr_mcs; bm++) {
++		struct mc *m;
++		struct sockaddr_in sin = {
++			.sin_family = AF_INET,
++			.sin_addr = bm->group,
++			.sin_port = htons(bm->port)
++		};
++		int ret;
++
++		m = hash_lookup_mc(bm->group);
++		if (!m) {
++
++			if (nr_mc == MAX_MC) {
++				logg(LOG_ERR, "Too many multicast groups when enabling bridge %s\n", b->last.name);
++				break;
++			}
++			m = mcs + nr_mc;
++			nr_mc++;
++
++			ret = hash_add_mc(m);
++			if (ret) {
++				logg(LOG_ERR, "Duplicate multicast address when enabling bridge %s\n", b->last.name);
++				break;
++			}
++
++		}
++		m->bridge = b;
++		m->addr = bm->group;
++		m->interface[INFINIBAND].sendonly = bm->sendonly[INFINIBAND];
++		m->interface[ROCE].sendonly = bm->sendonly[ROCE];
++		m->text = strdup(inet_ntoa(sin.sin_addr));
++		m->tos_mode = bm->tos_mode;
++		m->mgid_mode = bm->mgid_mode;
++		m->port = bm->port;
++		setup_mc_addrs(m, &sin);
++
++		m->enabled = true;
++	}
++	check_joins(NULL);
 +	b->active = true;
 +}
 +
 +static void disable_bridge(struct bridge_state *b)
 +{
 +	logg(LOG_INFO, "Stopping to bridge for %s\n", inet_ntoa(b->origin[0]));
-+	/* Unsubscripe from all MC groups of the specified bridge */
++
++	leave_mc(INFINIBAND, b);
++	leave_mc(ROCE, b);
 +	b->active = false;
 +}
 +
@@ -138,11 +155,25 @@ Index: rdma-core/ib2roce/beacon.c
  	for(m = mcs; m < mcs + nr_mc; m++) {
 -		b->mc[m - mcs].addr = m->addr;
 -		b->mc[m - mcs].port = m->port;
-+		memcpy(buf->cur, &m->addr, sizeof(struct in_addr));
-+		buf->cur += sizeof(struct in_addr);
-+		memcpy(buf->cur, &m->port, sizeof(unsigned));
-+		buf->cur += sizeof(unsigned);
++		struct beacon_multicast *bm = (void *)buf->cur;
++
++		if (m->admin || !m->enabled || m->bridge)
++			continue;
++
++		bm->group = m->addr;
++		bm->tos_mode = m->tos_mode;
++		bm->port = m->port;
++		bm->sendonly[INFINIBAND] = m->interface[INFINIBAND].sendonly;
++		bm->sendonly[ROCE] = m->interface[ROCE].sendonly;
++		bm->mgid_mode = m->mgid_mode;
++
++		buf->cur += sizeof(struct beacon_multicast);
  	}
++
++	/* Max MTU is 4096 bytes */
++	if (buf->cur > buf->raw + 4096)
++		abort();
++
 +	b->timestamp = now = timestamp();
 +	buf->end = buf->cur;
  }
@@ -154,7 +185,7 @@ Index: rdma-core/ib2roce/beacon.c
  	char bridge[40];
  	uint64_t diff;
  
-@@ -109,17 +177,67 @@ static void beacon_received(struct mc *m
+@@ -109,17 +198,67 @@ static void beacon_received(struct mc *m
  	}
  
  	now = timestamp();
@@ -227,7 +258,7 @@ Index: rdma-core/ib2roce/beacon.c
  	struct buf *buf;
  
  	if (beacon_mc) {
-@@ -127,23 +245,15 @@ static void beacon_send(void *private)
+@@ -127,23 +266,15 @@ static void beacon_send(void *private)
  
  		for(in = 0; in < NR_INTERFACES; in++) {
  			struct i2r_interface *i = i2r + in;
@@ -256,7 +287,7 @@ Index: rdma-core/ib2roce/beacon.c
  		struct i2r_interface *i = find_interface(beacon_sin);
  
  		if (!i) {
-@@ -152,18 +262,25 @@ static void beacon_send(void *private)
+@@ -152,43 +283,48 @@ static void beacon_send(void *private)
  			return;
  		}
  		buf = alloc_buffer(i->multicast);
@@ -288,7 +319,12 @@ Index: rdma-core/ib2roce/beacon.c
  }
  
  void beacon_setup(void)
-@@ -175,17 +292,14 @@ void beacon_setup(void)
+ {
+-	struct mgid_signature *mgid;
++	uint8_t mgid;
+ 	struct in_addr addr;
+ 	uint8_t tos;
+ 
  	if (!beacon)
  		return;
  
@@ -308,7 +344,11 @@ Index: rdma-core/ib2roce/beacon.c
  		m->mgid_mode = mgid;
  		m->tos_mode = tos;
  		m->addr = addr;
-@@ -199,21 +313,72 @@ void beacon_setup(void)
++		m->admin = true;
+ 
+ 		setup_mc_addrs(m, beacon_sin);
+ 
+@@ -199,21 +335,73 @@ void beacon_setup(void)
  			beacon_sin = NULL;
  		} else
  			beacon_mc = m;
@@ -361,10 +401,9 @@ Index: rdma-core/ib2roce/beacon.c
 +
 +		inet_ntop(AF_INET, &b->origin[ROCE], origin_roce, INET_ADDRSTRLEN);
 +
-+		printf("%2ld|%20s/%20s|%10x|%s|%s|%10d|%10d\n",
++		printf("%2ld|%20s|%10x|%s|%s|%10d|%10d\n",
 +				(b - remote_bridge) + 1,
-+				inet_ntoa(b->origin[INFINIBAND]),
-+				origin_roce,
++				b->last.name,
 +				b->last.sessionid,
 +				ex,
 +				b->active ? "Bridging" : "Monitoring",
@@ -382,36 +421,25 @@ Index: rdma-core/ib2roce/beacon.c
 +	register_concom("beacons", true, 0, "Show Beacon info", beacon_cmd);
 +
 +	sessionid = rand();
++	if (gethostname(hostname, sizeof(hostname) < 0))
++			logg(LOG_CRIT, "Cannot determine hostname: %s\n", errname());
  }
  
 Index: rdma-core/ib2roce/ib2roce.c
 ===================================================================
 --- rdma-core.orig/ib2roce/ib2roce.c
 +++ rdma-core/ib2roce/ib2roce.c
-@@ -1315,22 +1315,6 @@ static void status_write(void *private)
- }
+@@ -292,6 +292,9 @@ void receive_multicast(struct buf *buf)
+ 		goto invalid_packet;
+ 	}
  
- #ifdef UNICAST
--/* A mini router follows */
--static struct i2r_interface *find_interface(struct sockaddr_in *sin)
--{
--	struct i2r_interface *i;
--
--	for(i = i2r; i < i2r + NR_INTERFACES; i++)
--	    if (i->context) {
--		unsigned netmask = i->if_netmask.sin_addr.s_addr;
--
--		if ((sin->sin_addr.s_addr & netmask) ==  (i->if_addr.sin_addr.s_addr & netmask))
--			return i;
--	}
--
--	return NULL;
--}
--
- /* Ship a unicast datagram to an IP address .... */
- static void send_buf_to(struct i2r_interface *i, struct buf *buf, struct sockaddr_in *sin)
- {
-@@ -1707,6 +1691,7 @@ int main(int argc, char **argv)
++	if (!m->enabled)
++		return;
++
+ 	if (m->interface[in].sendonly) {
+ 
+ 		logg(LOG_INFO, "Discard Packet: Received data from Sendonly MC group %s from %s\n",
+@@ -1631,6 +1634,7 @@ int main(int argc, char **argv)
  	if (event_loop() <0)
  		logg(LOG_ERR, "Event Loop failed with %s\n", errname());
  
@@ -423,224 +451,189 @@ Index: rdma-core/ib2roce/interfaces.c
 ===================================================================
 --- rdma-core.orig/ib2roce/interfaces.c
 +++ rdma-core/ib2roce/interfaces.c
-@@ -863,7 +863,7 @@ void post_receive_buffers(void)
- }
+@@ -545,7 +545,7 @@ void shutdown_ib(void)
+ 	if (!i2r[INFINIBAND].context)
+ 		return;
  
+-	leave_mc(INFINIBAND);
++	leave_mc(INFINIBAND, NULL);
  
--static void reset_flags(struct buf *buf)
-+void reset_flags(struct buf *buf)
- {
- 	memset(&buf->ip_valid, 0, (void *)&buf->ip_csum_ok - (void *)&buf->ip_valid);
- }
-@@ -1057,6 +1057,23 @@ void handle_receive_packet(void *private
- 	put_buf(buf);
- }
+ 	/* Shutdown Interface */
+ 	qp_destroy(i2r + INFINIBAND);
+@@ -556,7 +556,7 @@ void shutdown_roce(void)
+ 	if (!i2r[ROCE].context)
+ 		return;
  
-+/* A mini router follows */
-+struct i2r_interface *find_interface(struct sockaddr_in *sin)
-+{
-+	struct i2r_interface *i;
-+
-+	for(i = i2r; i < i2r + NR_INTERFACES; i++)
-+	    if (i->context) {
-+		unsigned netmask = i->if_netmask.sin_addr.s_addr;
-+
-+		if ((sin->sin_addr.s_addr & netmask) ==  (i->if_addr.sin_addr.s_addr & netmask))
-+			return i;
-+	}
-+
-+	return NULL;
-+}
-+
-+
- static unsigned show_interfaces(char *b)
- {
- 	struct i2r_interface *i;
-Index: rdma-core/ib2roce/interfaces.h
-===================================================================
---- rdma-core.orig/ib2roce/interfaces.h
-+++ rdma-core/ib2roce/interfaces.h
-@@ -136,11 +136,15 @@ void set_rates(void);
- /* Scan a cores rdma channels for completion queue entries */
- void scan_cqs(void *private);
+-	leave_mc(ROCE);
++	leave_mc(ROCE, NULL);
  
-+void reset_flags(struct buf *);
-+
- int check_rdma_device(enum interfaces i, int port, char *name,
- 	       struct ibv_context *c, struct ibv_port_attr *a, struct ibv_device_attr *d);
- 
- /* Scan through available RDMA devices in order to locate the devices for bridging */
- int find_rdma_devices(void);
-+/* Find the interface that allows us to reach a certain IP address */
-+struct i2r_interface *find_interface(struct sockaddr_in *sin);
- 
- void check_out_of_buffer(void *);
- 
-Index: rdma-core/ib2roce/buffers.c
-===================================================================
---- rdma-core.orig/ib2roce/buffers.c
-+++ rdma-core/ib2roce/buffers.c
-@@ -43,6 +43,7 @@
- #include "buffers.h"
- #include "endpoint.h"
- #include "cli.h"
-+#include "hash.h"
- 
- #include <sys/mman.h>
- #include <stdatomic.h>
-@@ -455,6 +456,94 @@ int send_buf(struct buf *buf, struct rdm
- }
- 
- 
-+static unsigned keylength[nr_hashes] = { 4, 6, 16, 2 };
-+
-+struct rdma_unicast *hash_table[nr_hashes][0x100];
-+
-+static unsigned generate_hash_key(enum hashes type, uint8_t *key, void *p)
-+{
-+	int i;
-+	unsigned sum = 0;
-+
-+	memcpy(key, p, keylength[type]);
-+
-+	for (i = 0; i < keylength[type]; i++)
-+		sum += key[i];
-+
-+	return sum & 0xff;
-+}
-+
-+static struct rdma_unicast *find_key_in_chain(enum hashes type,
-+	struct rdma_unicast *next, uint8_t *key)
-+{
-+	for ( ; next != NULL; next = next->hash[type].next)
-+		if (memcmp(key, next->hash[type].key, keylength[type]) == 0)
-+			break;
-+
-+	return next;
-+}
-+
-+static void add_to_hash(struct rdma_unicast *ra, enum hashes type, void *p)
-+{
-+	struct hash_item *h = &ra->hash[type];
-+
-+	if (h->member)
-+		abort();        /* Already a member of the hash */
-+
-+	h->hash = generate_hash_key(type, h->key, p);
-+
-+	/* Duplicate key ? */
-+	if (find_key_in_chain(type, hash_table[type][h->hash], h->key))
-+		abort();
-+
-+	h->next = hash_table[type][h->hash];
-+	hash_table[type][h->hash] = ra;
-+
-+	h->member = true;
-+}
-+
-+static struct rdma_unicast *find_in_hash(enum hashes type, void *p)
-+{
-+	uint8_t key[hash_max_keylen];
-+	unsigned hash;
-+
-+	hash = generate_hash_key(type, key, p);
-+
-+	return find_key_in_chain(type, hash_table[type][hash], key);
-+}
-+
-+/* Ship a unicast datagram to an IP address .... */
-+void send_buf_to(struct i2r_interface *i, struct buf *buf, struct sockaddr_in *sin)
-+{
-+	struct rdma_unicast *ra;
-+	int ret;
-+
-+	/* Find address */
-+	ra = find_in_hash(hash_ip, &sin->sin_addr);
-+	if (!ra) {
-+		ra = new_rdma_unicast(i, sin);
-+		add_to_hash(ra, hash_ip, &sin->sin_addr);
-+	}
-+
-+	switch (ra->state) {
-+		case UC_NONE:   /* We need to resolve the address. Queue up the buffer and initiate */
-+			fifo_put(&ra->pending, buf);
-+			resolve(ra);
-+			return;
-+
-+		case UC_CONNECTED: /* Channel is open. We can send now */
-+			ret = send_buf(buf, ra);
-+			if (!ret)
-+				logg(LOG_ERR, "Failed to send to %s:%d\n",
-+				inet_ntoa(sin->sin_addr), ntohs(sin->sin_port));
-+			return;
-+
-+		default:                /* Resolution is in progress. Just queue it up on the address */
-+			fifo_put(&ra->pending, buf);
-+			return;
-+	}
-+}
-+
- static void buffers_cmd(char *parameters)
- {
- 	struct buf *buf;
+ 	/* Shutdown Interface */
+ 	qp_destroy(i2r + ROCE);
+@@ -615,7 +615,7 @@ void handle_rdma_event(void *private)
+ 					param->ah_attr.sl,
+ 					i->text);
+ 				st(i->multicast, join_success);
+-
++				m->enabled = true;
+ 				set_rate(m);
+ 			}
+ 			break;
 Index: rdma-core/ib2roce/beacon.h
 ===================================================================
 --- rdma-core.orig/ib2roce/beacon.h
 +++ rdma-core/ib2roce/beacon.h
-@@ -38,5 +38,5 @@
+@@ -37,6 +37,51 @@
+  *
   */
  
- void beacon_setup(void);
--
-+void beacon_shutdown(void);
- #endif
-Index: rdma-core/ib2roce/endpoint.h
-===================================================================
---- rdma-core.orig/ib2roce/endpoint.h
-+++ rdma-core/ib2roce/endpoint.h
-@@ -80,6 +80,18 @@ void list_endpoints(struct i2r_interface
- 
- enum uc_state { UC_NONE, UC_ADDR_REQ, UC_ROUTE_REQ, UC_CONN_REQ, UC_CONNECTED, UC_ERROR };
- 
-+/* Enough to fit a GID */
-+#define hash_max_keylen 16
-+
-+struct hash_item {
-+	struct rdma_unicast *next;      /* Linked list to avoid collisions */
-+	unsigned hash;
-+	bool member;
-+	uint8_t key[hash_max_keylen];
+-void beacon_setup(void);
++/*
++ * Multicast state in the beacon packet
++ */
++struct beacon_multicast {
++	struct in_addr group;
++	bool sendonly[2];
++	uint8_t tos_mode;
++	uint8_t mgid_mode;
++	uint16_t port;
 +};
 +
-+enum hashes { hash_ip, hash_mac, hash_gid, hash_lid, nr_hashes };
-+
- struct rdma_unicast {
- 	struct i2r_interface *i;
- 	enum uc_state state;
-@@ -87,6 +99,7 @@ struct rdma_unicast {
- 	struct rdma_channel *c;		/* Channel for resolution and I/O */
- 	struct fifo pending;		/* Buffers waiting on resolution to complete */
- 	struct ah_info ai;		/* If ai.ah != NULL then the address info is valid */
-+	struct hash_item hash[nr_hashes];
- };
++/*
++ * Beacon info
++ */
++struct beacon_info {
++	unsigned long signature;
++	char version[10];
++	char name[20];			/* The Hostname of the remote bridge */
++	unsigned sessionid;		/* Unique session id created on startup */
++	unsigned hold_time;		/* Validity of the Beacon Info */
++	unsigned sqn;
++	uint64_t timestamp;
++	bool infiniband;
++	struct in_addr addr[2];		/* Addresses of the bridge */
++	unsigned nr_mc;			/* Active Multicast */
++	unsigned nr_tsi;		/* Active TSIs */
++	struct beacon_multicast mc[];	/* nr_mc beacon_jp_multicast instances follow */
++};
  
- struct rdma_unicast *new_rdma_unicast(struct i2r_interface *i, struct sockaddr_in *sin);
++/*
++ * Remote bridge states: This is controlled by the beacons that will refresh
++ * the expiration time. If the expiration occurs then the bridge will take subscribe
++ * to all the multicast groups of that bridge.
++ * If a new beacon is encoutered from that bridge then there will be an unsubscribe.
++ */
++struct bridge_state {
++	unsigned long expiration;
++	bool active;
++	struct in_addr origin[2];
++	unsigned beacons_missed;
++	unsigned beacons_received;
++	struct beacon_info last;
++};
++
++void beacon_setup(void);
++void beacon_shutdown(void);
+ #endif
++
 Index: rdma-core/ib2roce/multicast.h
 ===================================================================
 --- rdma-core.orig/ib2roce/multicast.h
 +++ rdma-core/ib2roce/multicast.h
-@@ -92,10 +92,14 @@ struct mc_interface {
- 	unsigned long delayed;		/* Packets delayed */
- };
- 
-+struct bridge_state;
-+
- struct mc {
+@@ -96,6 +96,9 @@ struct mc {
  	struct in_addr addr;
  	struct mc_interface interface[2];
  	void (*callback)(struct mc *, enum interfaces, struct buf *);
-+	struct bridge *bridge_state;		/* Set if its a remote bridge */
++	struct bridge_state *bridge;		/* Set if its a remote bridge */
 +	bool enabled;				/* Is forwarding active ? */
++	bool admin;				/* Administrative group */
  	uint8_t tos_mode;
+ 	uint8_t mgid_mode;
  	uint16_t port;
- 	struct mgid_signature *mgid_mode;
+@@ -118,7 +121,7 @@ int _join_mc(struct in_addr addr, struct
+ 	unsigned port, uint8_t tos, enum interfaces i, bool sendonly, void *private);
+ int _leave_mc(struct in_addr addr,struct sockaddr *si, enum interfaces i);
+ 
+-int leave_mc(enum interfaces i);
++int leave_mc(enum interfaces i, struct bridge_state *);
+ 
+ void check_joins(void *);
+ 
+Index: rdma-core/ib2roce/multicast.c
+===================================================================
+--- rdma-core.orig/ib2roce/multicast.c
++++ rdma-core/ib2roce/multicast.c
+@@ -66,6 +66,7 @@
+ #include "interfaces.h"
+ #include "multicast.h"
+ #include "cli.h"
++#include "beacon.h"
+ 
+ unsigned default_mc_port = 4711;	/* Port for MC groups that do not have a port (if a port is required) */
+ uint8_t tos_mode = 0;
+@@ -403,7 +404,7 @@ int _leave_mc(struct in_addr addr,struct
+ 	return 0;
+ }
+ 
+-int leave_mc(enum interfaces i)
++int leave_mc(enum interfaces i, struct bridge_state *br)
+ {
+ 	int j;
+ 	int ret;
+@@ -411,6 +412,10 @@ int leave_mc(enum interfaces i)
+ 	for (j = 0; j < nr_mc; j++) {
+ 		struct mc *m = mcs + j;
+ 
++		if (br && m->bridge != br)
++			continue;
++
++		m->enabled = false;
+ 		ret = _leave_mc(m->addr, m->interface[i].sa, i);
+ 		if (ret)
+ 			return 1;
+@@ -432,6 +437,9 @@ static void join_processing(void)
+ 		struct mc *m = mcs + i;
+ 		unsigned port = m->port;
+ 
++		if (!m->enabled)
++			continue;
++
+ 		if (m->interface[ROCE].status == MC_JOINED && m->interface[INFINIBAND].status == MC_JOINED)
+ 			continue;
+ 
+@@ -511,18 +519,24 @@ static void multicast_cmd(char *paramete
+ 	for(m = mcs; m < mcs + nr_mc; m++) {
+ 
+ 		for(enum interfaces in = INFINIBAND; in <= ROCE; in++) {
+-			printf("%s %s %s %s %s packet_time=%dns, max_burst=%d packets, delayed=%ld packets, last_sent=%ldms ago, last_delayed=%ldms ago, pending=%u packets, burst=%d\n",
+-				interfaces_text[in], m->text,
+-			mc_text[m->interface[in].status],
+-			m->interface[in].sendonly ? "Sendonly " : "",
+-			in == INFINIBAND ? mgid_text(m) : "",
+-			m->interface[in].packet_time,
+-			m->interface[in].max_burst,
+-			m->interface[in].delayed,
+-			m->interface[in].last_sent ? (now - m->interface[in].last_sent) / ONE_MILLISECOND : -999,
+-			m->interface[in].last_delayed ? (now - m->interface[in].last_delayed) / ONE_MILLISECOND : -999,
+-			m->interface[INFINIBAND].pending,
+-			m->interface[in].burst);
++			printf("%s %s %s %s %s ", interfaces_text[in], m->text,
++				mc_text[m->interface[in].status],
++				m->interface[in].sendonly ? "Sendonly " : "",
++				in == INFINIBAND ? mgid_text(m) : "");
++			if (!m->enabled)
++				printf(" disabled");
++
++			if (m->bridge)
++				printf(" bridge %s", m->bridge->last.name);
++
++			printf("packet_time=%dns, max_burst=%d packets, delayed=%ld packets, last_sent=%ldms ago, last_delayed=%ldms ago, pending=%u packets, burst=%d\n",
++				m->interface[in].packet_time,
++				m->interface[in].max_burst,
++				m->interface[in].delayed,
++				m->interface[in].last_sent ? (now - m->interface[in].last_sent) / ONE_MILLISECOND : -999,
++				m->interface[in].last_delayed ? (now - m->interface[in].last_delayed) / ONE_MILLISECOND : -999,
++				m->interface[INFINIBAND].pending,
++				m->interface[in].burst);
+ 		}
+ 	}
+ }

@@ -1,4 +1,7 @@
-#fix_help
+check_join_move
+mgid_to_uint8_t
+move_find_interface
+unicast_support
 make_beacon_pim
 create_pim_infrastructure
 traff_class_instead

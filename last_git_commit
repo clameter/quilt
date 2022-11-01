@@ -1,0 +1,118 @@
+commit d4a3a587a7b3b2ed1ff2b5493e3ef02d969a8a5c
+Author: Christoph Lameter <cl@linux.com>
+Date:   Tue Nov 1 10:16:37 2022 +0100
+
+    Fix output formatting for the "cores" and "interface" command
+
+diff --git a/ib2roce/channel.c b/ib2roce/channel.c
+index 4ffa9ff5..5809d9c0 100644
+--- a/ib2roce/channel.c
++++ b/ib2roce/channel.c
+@@ -735,14 +735,24 @@ int channel_stats(char *b, struct rdma_channel *c, const char *interface, const
+ 	return n;
+ }
+ 
+-void channel_stat(FILE *out, struct rdma_channel *c)
++void channel_stat(int indent, FILE *out, struct rdma_channel *c)
+ {
+-	fprintf(out, "Channel %s: ActiveRecvBuffers=%u/%u ActiveSendBuffers=%u/%u CQ_high=%u SendQ=%u\n", c->text,
++	char indent_str[10];
++
++	if (indent > sizeof(indent_str) - 1)
++		panic("indent too high");
++
++	memset(indent_str, ' ', indent);
++	indent_str[indent] = 0;
++
++	fprintf(out, "%sChannel %s: ActiveRecvBuffers=%u/%u ActiveSendBuffers=%u/%u CQ_high=%u SendQ=%u\n", indent_str, c->text,
+ 		c->active_receive_buffers, c->nr_receive, c->active_send_buffers, c->nr_send, c->cq_high, fifo_items(&c->send_queue));
+ 
+ 	if (c->last_snapshot && (c->max_pps_in || c->max_pps_out))
+-		fprintf(out, " pps_in=%d pps_out=%d max_pps_in=%d max_pps_out=%d\n",
+-				c->pps_in, c->pps_out, c->max_pps_in, c->max_pps_out);
++		fprintf(out, "%s pps_in=%d pps_out=%d max_pps_in=%d max_pps_out=%d\n",
++			indent_str, c->pps_in, c->pps_out, c->max_pps_in, c->max_pps_out);
++
++	fprintf(out, "%s", indent_str);
+ 
+ 	for(int k = 0; k < nr_stats; k++)
+ 		if (c->stats[k])
+@@ -751,9 +761,14 @@ void channel_stat(FILE *out, struct rdma_channel *c)
+ 	fprintf(out, "\n");
+ }
+ 
++static void channel_stat_indent_0(FILE *f, struct rdma_channel *c)
++{
++	channel_stat(0, f, c);
++}
++
+ static void channels_cmd(FILE *out, char *parameters)
+ {
+-	all_channels(out, channel_stat);
++	all_channels(out, channel_stat_indent_0);
+ }
+ 
+ __attribute__((constructor))
+@@ -774,4 +789,6 @@ static void channel_init(void)
+ 
+ 	register_enable("statint", true, NULL, &stat_interval, "60", "1", NULL,
+ 		"Sampling interval to calculate pps values");
++	register_enable("latency", true, &latency, NULL, "on", "off", NULL,
++		"Collect latency statistics for cores busy polling");
+ }
+diff --git a/ib2roce/channel.h b/ib2roce/channel.h
+index 8c7dd280..c4fa7836 100644
+--- a/ib2roce/channel.h
++++ b/ib2roce/channel.h
+@@ -145,7 +145,7 @@ extern struct channel_info {
+ } channel_infos[nr_channel_types];
+ 
+ int channel_stats(char *b, struct rdma_channel *c, const char *interface, const char *type);
+-void channel_stat(FILE *out, struct rdma_channel *c);
++void channel_stat(int ident, FILE *out, struct rdma_channel *c);
+ 
+ void start_channel(struct rdma_channel *c);
+ void stop_channel(struct rdma_channel *c);
+diff --git a/ib2roce/interfaces.c b/ib2roce/interfaces.c
+index 5532b6ea..f47838b2 100644
+--- a/ib2roce/interfaces.c
++++ b/ib2roce/interfaces.c
+@@ -1215,7 +1215,7 @@ static unsigned show_interfaces(char *b)
+ 		unsigned stats[nr_stats];
+ 
+ 		if (sum_stats(stats, i, channel_rdmacm)) {
+-			n = sprintf(b, "Interface %s:", i->text);
++			n += sprintf(b + n, "Interface %s:", i->text);
+ 
+ 			for(int j = 0; j < nr_stats; j++) {
+ 				if (stats[j])
+@@ -1224,7 +1224,7 @@ static unsigned show_interfaces(char *b)
+ 			n += sprintf(b + n, "\n");
+ 
+ 		} else
+-			n = sprintf(b, "Interface %s: No Traffic\n", i->text);
++			n += sprintf(b + n, "Interface %s: No Traffic\n", i->text);
+ 	}
+ 	return n;
+ }
+diff --git a/ib2roce/sched.c b/ib2roce/sched.c
+index 06d401cf..3d57e160 100644
+--- a/ib2roce/sched.c
++++ b/ib2roce/sched.c
+@@ -342,14 +342,14 @@ static void core_cmd(FILE *out, char *parameters) {
+ 				unsigned j;
+ 				struct core_info *ci = core_infos + i;
+ 
+-				fprintf(out, "Core %d: NUMA=%d", i, ci->numa_node);
++				fprintf(out, "Core %d: NUMA=%d\n", i, ci->numa_node);
+ 				if (latency)
+ 					fprintf(out, " Loops over 5usecs=%u Average=%luns, Max=%uns, Min=%uns\n",
+ 						ci->samples, ci->samples ? ci->sum_latency / ci->samples : 0,
+ 						ci->max_latency, ci->min_latency);
+ 
+ 				for (j = 0; j < ci->nr_channels; j++)
+-					channel_stat(out, ci->channel[j]);
++					channel_stat(1, out, ci->channel[j]);
+ 			}
+ 		} else
+ 			fprintf(out, "No cores active. ib2roce operates in single threaded mode.\n");

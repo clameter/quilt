@@ -1,0 +1,94 @@
+Index: rdma-core/ib2roce/channel.c
+===================================================================
+--- rdma-core.orig/ib2roce/channel.c
++++ rdma-core/ib2roce/channel.c
+@@ -712,6 +712,10 @@ static void channel_zap(FILE *out, struc
+ 
+ 		}
+ 	}
++	c->bytes_received = 0;
++	c->bytes_sent = 0;
++	c->min_packet_size = 0;
++	c->max_packet_size = 0;
+ }
+ 
+ 
+@@ -732,6 +736,22 @@ int channel_stats(char *b, struct rdma_c
+ 		if (c->stats[j]) {
+ 			n += sprintf(b + n, "%s=%u\n", stats_text[j], c->stats[j]);
+ 	}
++	if (c->bytes_sent)
++		n += sprintf(b +n, "bytes sent=%lu\n", c->bytes_sent);
++
++	if (c->bytes_received)
++		n += sprintf(b +n, "bytes received=%lu\n", c->bytes_received);
++
++	if (c->min_packet_size)
++		n += sprintf(b + n, "MinPSize=%u\n", c->min_packet_size);
++
++	if (c->max_packet_size)
++		n += sprintf(b + n, "MaxPSize=%u\n", c->max_packet_size);
++	
++	if (c->stats[packets_received]) {
++		n += sprintf(b +n, "AvgPsize=%lu\n", c->bytes_received / c->stats[packets_received]);
++	}
++
+ 	return n;
+ }
+ 
+Index: rdma-core/ib2roce/channel.h
+===================================================================
+--- rdma-core.orig/ib2roce/channel.h
++++ rdma-core/ib2roce/channel.h
+@@ -101,6 +101,10 @@ struct rdma_channel {
+ 	unsigned int nr_send;		/* Maximum number of write buffers to use */
+ 	unsigned int nr_receive;	/* Number of read buffer to post */
+ 	unsigned stats[nr_stats];
++	unsigned long bytes_sent;
++	unsigned long bytes_received;
++	unsigned min_packet_size;
++	unsigned max_packet_size;
+ 	enum channel_type type;
+ 	struct fifo send_queue;		/* Packets that were deferred for write */
+ 	bool listening;			/* rdmacm Channel is listening for connections */
+Index: rdma-core/ib2roce/interfaces.c
+===================================================================
+--- rdma-core.orig/ib2roce/interfaces.c
++++ rdma-core/ib2roce/interfaces.c
+@@ -1014,7 +1014,6 @@ static void process_cqes(struct rdma_cha
+ 		if (w->status == IBV_WC_SUCCESS && w->opcode == IBV_WC_RECV) {
+ 
+ 			c->active_receive_buffers--;
+-			st(c, packets_received);
+ 
+ 			if (c != buf->c) {
+ 				logg(LOG_CRIT, "%s: RDMA Channel mismatch CQE is from %s.\n", c->text, buf->c->text);
+@@ -1054,14 +1053,28 @@ static void process_cqes(struct rdma_cha
+ 
+ 			buf->ip_csum_ok = (w->wc_flags & IBV_WC_IP_CSUM_OK) != 0;
+ 
++			/* Update channel statistics */
++			st(c, packets_received);
++
++			c->bytes_received += w->byte_len;
++
++			if (w->byte_len < c->min_packet_size || c->min_packet_size == 0)
++				c->min_packet_size = w->byte_len;
++
++			if (w->byte_len > c->max_packet_size)
++				c->max_packet_size = w->byte_len;
++
+ 			c->receive(buf);
+ 			put_buf(buf);
+ 
+ 		} else {
+ 			if (w->status == IBV_WC_SUCCESS && w->opcode == IBV_WC_SEND) {
+ 				c->active_send_buffers--;
++
+ 				/* Completion entry */
+ 				st(c, packets_sent);
++				c->bytes_sent += w->byte_len;
++
+ 				put_buf(buf);
+ 			} else
+ 				logg(LOG_NOTICE, "Strange CQ Entry %d/%d: Status:%x Opcode:%x Len:%u QP=%x SRC_QP=%x Flags=%x\n",

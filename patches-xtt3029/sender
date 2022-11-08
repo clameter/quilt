@@ -1,0 +1,24 @@
+Index: rdma-core/ib2roce/ib2roce.c
+===================================================================
+--- rdma-core.orig/ib2roce/ib2roce.c
++++ rdma-core/ib2roce/ib2roce.c
+@@ -558,6 +558,8 @@ int main(int argc, char **argv)
+ 
+ 	beacon_setup();
+ 
++	if (mode == mode_sender)
++		sender_setup();
+ 
+ 	post_receive_buffers();
+ 
+@@ -575,6 +577,10 @@ int main(int argc, char **argv)
+ 		sd_notify(0, "STOPPING=1");
+ 
+ 	beacon_shutdown();
++
++	if (mode == mode_sender)
++		sender_shutdown();
++
+ 	stop_cores();
+ 
+ 	shutdown_roce();

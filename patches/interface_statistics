@@ -1,0 +1,55 @@
+Index: rdma-core/ib2roce/interfaces.c
+===================================================================
+--- rdma-core.orig/ib2roce/interfaces.c
++++ rdma-core/ib2roce/interfaces.c
+@@ -1206,10 +1206,21 @@ static unsigned show_interfaces(char *b)
+ {
+ 	int n = 0;
+ 
+-	interface_foreach(i)
+-		channel_foreach(c, &i->channels)
+-			n += channel_stats(b + n, c, i->text, c->text);
++	interface_foreach(i) {
++		unsigned stats[nr_stats];
+ 
++		if (sum_stats(stats, i, channel_rdmacm)) {
++			n = sprintf(b, "Interface %s:", i->text);
++
++			for(int j = 0; j < nr_stats; j++) {
++				if (stats[j])
++					n += sprintf(b + n, " %s=%u", stats_text[j], stats[j]);
++			}
++			n += sprintf(b + n, "\n");
++
++		} else
++			n = sprintf(b, "Interface %s: No Traffic\n", i->text);
++	}
+ 	return n;
+ }
+ 
+Index: rdma-core/ib2roce/interfaces.h
+===================================================================
+--- rdma-core.orig/ib2roce/interfaces.h
++++ rdma-core/ib2roce/interfaces.h
+@@ -132,6 +132,8 @@ struct i2r_interface {
+ 
+ extern struct i2r_interface i2r[];
+ 
++bool sum_stats(unsigned *stats, struct i2r_interface *i, enum channel_type type);
++
+ /* Interator for the Interfaces */
+ #define interface_foreach(_interface)								\
+ 	for(struct i2r_interface *_interface = i2r; _interface < i2r + NR_INTERFACES;_interface++) \
+Index: rdma-core/ib2roce/logging.c
+===================================================================
+--- rdma-core.orig/ib2roce/logging.c
++++ rdma-core/ib2roce/logging.c
+@@ -162,7 +162,7 @@ char *hexbytes(uint8_t *q, unsigned len,
+ 	return __hexbytes(b, q, len, separator);
+ }
+ 
+-static bool sum_stats(unsigned *stats, struct i2r_interface  *i, enum channel_type type)
++bool sum_stats(unsigned *stats, struct i2r_interface  *i, enum channel_type type)
+ {
+ 	bool r = false;
+ 

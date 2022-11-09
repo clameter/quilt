@@ -1,71 +1,429 @@
---- ib2roce/ib2roce.c
-+++ ib2roce/ib2roce.c
-@@ -1003,17 +1003,17 @@ static char *pgm_dump(struct pgm_header
- /*
-  * Handling of RDMA work requests
-  */
--static int post_receive(struct rdma_channel *c, int limit)
-+static void post_receive(struct rdma_channel *c)
+Index: rdma-core/ib2roce/beacon.c
+===================================================================
+--- rdma-core.orig/ib2roce/beacon.c
++++ rdma-core/ib2roce/beacon.c
+@@ -574,7 +574,7 @@ static void beacon_init(void)
+ 
+ 	register_option("beacon", optional_argument, 'b', beacon_option,
+ 			"<addr>[:port][/interval]", "Send beacon in given milliseconds. 1 second by default");
+-	register_concom("beacons", true, 0, "Show Beacon info", beacon_cmd);
++	register_concom("beacons", flag_args | mode_bridge, 0, "Show Beacon info", beacon_cmd);
+ 	register_enable("binterval", true, NULL, &beacon_interval, "1000", "100", NULL, "Beacon Interval");
+ 	register_enable("beacon", true, &beacon, NULL, "On", "Off", NULL, "Switch beacon off");
+ 
+Index: rdma-core/ib2roce/buffers.c
+===================================================================
+--- rdma-core.orig/ib2roce/buffers.c
++++ rdma-core/ib2roce/buffers.c
+@@ -577,7 +577,8 @@ static void buffers_cmd(FILE *out, char
+ __attribute__ ((constructor))
+ static void buffers_init(void)
  {
- 	struct ibv_recv_wr recv_wr, *recv_failure;
- 	struct ibv_sge sge;
- 	int ret = 0;
+-	register_concom("buffers", true, 0, "Print Information about buffer use", buffers_cmd);
++	register_concom("buffers", flag_prompt | mode_bridge | mode_listen | mode_sender,
++		0, "Print Information about buffer use", buffers_cmd);
+ 	register_enable("buffers", false, NULL, &nr_buffers, "1000000", "10000", NULL,
+ 		"Number of  8K buffers allocated for packet processing");
+ 	register_enable("huge", false, &huge, NULL, "on", "off", NULL,
+Index: rdma-core/ib2roce/channel.c
+===================================================================
+--- rdma-core.orig/ib2roce/channel.c
++++ rdma-core/ib2roce/channel.c
+@@ -774,8 +774,8 @@ static void channels_cmd(FILE *out, char
+ __attribute__((constructor))
+ static void channel_init(void)
+ {
+-	register_concom("zap", true, 0, "Clear counters", zap_cmd );
+-	register_concom("channels", true, 0, "Print information about communication channels", channels_cmd);
++	register_concom("zap", flag_prompt | mode_bridge | mode_listen | mode_sender, 0, "Clear counters", zap_cmd );
++	register_concom("channels", flag_prompt | mode_bridge | mode_listen | mode_sender, 0, "Print information about communication channels", channels_cmd);
  
--	if (!nextbuffer)
--		return -ENOMEM;
-+	if (!c || !nextbuffer)
-+		return;
+ 	register_enable("loopbackprev", false, &loopback_blocking, NULL, "on", "off", NULL,
+ 		"Multicast loopback prevention of the NIC");
+Index: rdma-core/ib2roce/cli.c
+===================================================================
+--- rdma-core.orig/ib2roce/cli.c
++++ rdma-core/ib2roce/cli.c
+@@ -48,9 +48,19 @@
  
--	if (c->active_receive_buffers >= limit)
--		return 0;
-+	if (c->active_receive_buffers >= c->max_receive_buffers)
-+		return;
+ #define MAX_CONCOMS 30
  
- 	recv_wr.next = NULL;
- 	recv_wr.sg_list = &sge;
-@@ -1038,38 +1037,18 @@ static int post_receive(struct rdma_chan
- 		if (ret) {
- 			free_buffer(buf);
- 			logg(LOG_WARNING, "ibv_post_recv failed: %s:%s\n", c->text, errname());
--			break;
-+			return;
-                 }
- 		c->active_receive_buffers++;
++static enum operation_mode mode;
++
++static const char *mode_text[] = {
++	NULL,
++	"ib2roce",
++	"mclisten",
++	NULL,
++	"mcsender"
++};
++
+ static struct concom {
+ 	const char *name;
+-	bool prompt;
++	enum operation_mode mode;
+ 	int parameters;
+ 	const char *description;
+ 	void (*callback)(FILE *out, char *parameters);
+@@ -58,7 +68,7 @@ static struct concom {
+ 
+ static int nr_concoms;
+ 
+-void register_concom(const char *name, bool prompt, int parameters, const char *text, void (*callback)(FILE *out, char *parameters))
++void register_concom(const char *name, enum operation_mode m, int parameters, const char *text, void (*callback)(FILE *out, char *parameters))
+ {
+ 	struct concom *c = concoms + nr_concoms;
+ 
+@@ -66,7 +76,7 @@ void register_concom(const char *name, b
+ 		panic("Too many console commands limit is %d\n", MAX_CONCOMS);
+ 
+ 	c->name = name;
+-	c->prompt = prompt;
++	c->mode = m;
+ 	c->parameters = parameters;
+ 	c->description = text;
+ 	c->callback = callback;
+@@ -78,11 +88,13 @@ static void help(FILE *out, char *parame
+ {
+ 	struct concom * cc;
+ 
+-	fprintf(out, "List of ib2roce console commands:\n");
++	fprintf(out, "List of %s console commands:\n", mode_text[ mode & 0xf] );
+ 	fprintf(out, "Command		Description\n");
+ 	fprintf(out, "----------------------------------------\n");
+ 
+-	for(cc = concoms; cc->name; cc++) {
++	for(cc = concoms; cc->name; cc++)
++		if (mode & cc->mode)
++	{
+ 		fprintf(out, "%-16s%s\n", cc->name, cc->description);
  	}
--	return ret;
  }
+@@ -94,7 +106,7 @@ static void exitcmd(FILE *out, char *par
  
--static int post_receive_buffers(struct i2r_interface *i)
-+static void post_receive_buffers(struct i2r_interface *i)
+ static void prompt(void *private)
  {
--	int ret = 0;
--
--	if (!nextbuffer)
--		return -EAGAIN;
--
--	ret = post_receive(i->multicast, i->multicast->nr_cq / 2);
--	if (ret)
--		goto out;
--
--	if (i->raw && i->raw->type == channel_raw)
--		ret = post_receive(i->raw, 100);
--
--	if (ret)
--		goto out;
--
--	if (i->qp1)
--		ret = post_receive(i->qp1, 10);
--
--	if (i->ud)
--		ret = post_receive(i->ud, 100);
--
--out:
--	return ret;
-+	post_receive(i->multicast);
-+	post_receive(i->raw);
-+	post_receive(i->qp1);
-+	post_receive(i->ud);
+-	printf("ib2roce-$ ");
++	printf("%s-$ ", mode_text[ mode & 0xf] );
+ 	fflush(stdout);
+ };
+ 
+@@ -170,10 +182,14 @@ static void console_input(void *private)
+ 				fprintf(out, "Command does not allow parameters\n");
+ 				goto out;
+ 			}
++			if (! (cc->mode & mode)) {
++				fprintf(out, "Command not available in this mode\n");
++				goto out;
++			}
+ 
+ 			cc->callback(out, p);
+ 
+-			if (!cc->prompt)
++			if (!(cc->mode & flag_prompt))
+ 				return;
+ 
+ 			goto out;
+@@ -284,10 +300,11 @@ struct opts_data {
+ 	void (*callback)(char *optarg);
+ 	const char *description;
+ 	const char *pardesc;
++	enum operation_mode mode;
+ 	struct option *opt;
+ } opts_datas[128];
+ 
+-void register_option(const char  *name, int has_arg, const char x, void (*callback)(char *optarg),
++void register_option(const char  *name, enum operation_mode m, const char x, void (*callback)(char *optarg),
+ 	const char *pardesc, const char *description)
+ {
+ 	struct option *o;
+@@ -299,13 +316,14 @@ void register_option(const char  *name,
+ 	o = opts + nr_opts;
+ 
+ 	o->name = name;
+-	o->has_arg = has_arg;
++	o->has_arg = m & flag_args;
+ 	o->flag = NULL;
+ 	o->val = x;
+ 	od->callback = callback;
+ 	od->description = description;
+ 	od->pardesc = pardesc;
+ 	od->opt = o;
++	od->mode = m;
+ 
+ 	nr_opts++;
+ }
+@@ -319,6 +337,26 @@ void parse_options(int argc, char **argv
+ 	int op;
+ 	int i;
+ 
++	p = rindex(argv[0],'/');
++	if (p)
++		p++;
++	else
++		p = argv[0];
++
++	/* Find operation mode */
++	if (strncmp(p, "ib2roce", 7) == 0)
++		mode = mode_bridge;
++	else {
++		bridging = false;
++
++		if (strncmp(p, "mclisten", 8) == 0)
++			mode = mode_listen;
++		else if (strncmp(p, "mcsender", 8) == 0)
++			mode = mode_sender;
++		else
++			panic("Cannot identify operation mode. Binary must be called mclisten, mcsender or ib2roce\n");
++	}
++
+ 	/* Compose opt_string from opts */
+ 	p = opt_string;
+ 	for(i = 0; i < 128; i++) {
+@@ -339,16 +377,25 @@ void parse_options(int argc, char **argv
+ 
+ 	while ((op = getopt_long(argc, argv, opt_string,
+ 					opts, NULL)) != -1) {
++		struct opts_data *od = opts_datas + op;
++
+ 		if (!optarg && argv[optind] && argv[optind][0] != '-') {
+ 			optarg = argv[optind];
+ 			optind++;
+ 		}
+-		if (op != '?' && opts_datas[op].callback)
++		if (op != '?' && od->callback) {
+ 
+-			opts_datas[op].callback(optarg);
+-		else
++			if (!(od->mode & mode))
++				panic("Option %s not allowed\n", od->opt->name);
++
++			od->callback(optarg);
++		} else
+ 			help_opt(NULL);
+ 	}
++	while (optind < argc) {
++		new_mc_addr(argv[optind], false, false);
++		optind++;
++	}
+ }
+ 
+ /*
+@@ -389,6 +436,10 @@ static void readconfig(char *file)
+ 			if (strcasecmp(o->name, q) == 0) {
+ 				struct opts_data *od = opts_datas + o->val;
+ 
++				if (!(od->mode & mode)) {
++					panic("Operation %s not allowed in this mode\n", q);
++				}
++
+ 				od->callback(optarg);
+ 				goto skip;
+ 			}
+@@ -408,7 +459,7 @@ static void help_opt(char *optarg)
+ 	int i;
+ 
+ 	printf("ib2roce " VERSION " Christoph Lameter <cl@linux.com>\n");
+-	printf("Usage: ib2roce [<option>] ... \n");
++	printf("Usage: %s [<option>] ... \n", mode_text[mode]);
+ 
+ 	for(i = 0; i < 128; i++) {
+ 		struct opts_data *od = opts_datas + i;
+@@ -418,8 +469,9 @@ static void help_opt(char *optarg)
+ 		if (!od->description)
+ 			continue;
+ 
+-		snprintf(buffer, sizeof(buffer), "-%c|--%s %s ", i, o->name, od->pardesc? od->pardesc : " ");
+-		printf("%-50s %s\n", buffer, od->description);
++		if (od->mode & mode)
++			snprintf(buffer, sizeof(buffer), "-%c|--%s %s ", i, o->name, od->pardesc? od->pardesc : " ");
++				printf("%-50s %s\n", buffer, od->description);
+ 	}
+ 	exit(1);
+ }
+@@ -444,8 +496,10 @@ static void opts_init(void)
+ 			"Disable feature");
+ 	register_option("help", no_argument, 'h', help_opt, NULL, "Show these instructions");
+ 
+-	register_concom("help",	true,	0,	"Print a list of commands",			help );
+-	register_concom("quit",	false,	0,	"Terminate ib2roce",				exitcmd);
++	register_concom("help",	flag_prompt | mode_bridge | mode_listen | mode_sender,
++			0,	"Print a list of commands",			help );
++	register_concom("quit",	mode_bridge | mode_listen | mode_sender,
++			0,	"Terminate ib2roce",				exitcmd);
  }
  
  
-
+@@ -459,7 +513,7 @@ static void opts_init(void)
+ /* Table of options that can be set via -e option[=value] */
+ struct enable_option {
+ 	const char *id;
+-	bool runtime;		/* Is it changeable at runtime? */
++	enum operation_mode mode;		/* Is it changeable at runtime? */
+ 	bool *bool_flag;
+ 	int *int_flag;
+ 	const char *on_value;
+@@ -487,6 +541,9 @@ void enable(FILE *out, char *option, boo
+ 
+ 			eo = enable_table + i;
+ 
++			if (!(eo->mode & mode))
++				continue;
++
+ 			if (eo->bool_flag) {
+ 				if (*eo->bool_flag)
+ 					strcpy(state, "on");
+@@ -521,7 +578,12 @@ void enable(FILE *out, char *option, boo
+ 
+ got_it:
+ 	eo = enable_table + i;
+-	if (!eo->runtime && (i2r[ROCE].context || i2r[INFINIBAND].context)) {
++	if (!(eo->mode & mode)) {
++		fprintf(out, "Option %s not available in this mode\n", option);
++		return;
++	}
++
++	if (!(eo->mode & flag_runtime) && (i2r[ROCE].context || i2r[INFINIBAND].context)) {
+ 		fprintf(out, "Cannot change option \"%s\" at runtime\n", option);
+ 		return;
+ 	}
+@@ -556,7 +618,9 @@ got_it:
+ 		eo->callback();
+ }
+ 
+-void register_enable(const char *id, bool runtime, bool  *bool_flag, int *int_flag, const char *on_value, const char *off_value, void (*callback)(void), const char *description)
++void register_enable(const char *id, enum operation_mode m, bool  *bool_flag,
++		int *int_flag, const char *on_value, const char *off_value,
++		void (*callback)(void), const char *description)
+ {
+ 	struct enable_option *c = enable_table + nr_enable_options;
+ 
+@@ -564,7 +628,7 @@ void register_enable(const char *id, boo
+ 		panic("Too many console commands limit is %d\n", MAX_CONCOMS);
+ 
+ 	c->id = id;
+-	c->runtime = runtime;
++	c->mode = m;
+ 	c->bool_flag = bool_flag;
+ 	c->int_flag = int_flag;
+ 	c->on_value = on_value;
+@@ -587,8 +651,10 @@ __attribute__((constructor))
+ static void enable_init(void)
+ {
+ 	/* Integration into  the console */
+-	register_concom("disable", true, 1, "Disable optional features", disablecmd);
+-	register_concom("enable", true,	1, "Setup optional features and list them", enablecmd);
++	register_concom("disable", flag_prompt | mode_bridge | mode_listen | mode_sender,
++			1, "Disable optional features", disablecmd);
++	register_concom("enable", flag_prompt | mode_bridge | mode_listen | mode_sender,
++			1, "Setup optional features and list them", enablecmd);
+ }
+ 
+ 
+Index: rdma-core/ib2roce/cli.h
+===================================================================
+--- rdma-core.orig/ib2roce/cli.h
++++ rdma-core/ib2roce/cli.h
+@@ -40,16 +40,28 @@
+ #include <stdbool.h>
+ #include <getopt.h>
+ 
+-#define VERSION "2022.0512"
++#define VERSION "2022.1105"
++
++enum operation_mode {
++	mode_bridge = 1 << 0,
++	mode_listen = 1 << 1,
++	mode_sender = 1 << 2,
++
++	/* Registration options */
++	flag_prompt = 1 << 8,
++	flag_runtime = 1 << 9,
++	flag_args = 1 << 10
++};
++
+ 
+ /* Command registration for the CLI */
+-void register_concom(const char *name, bool prompt, int parameters, const char *text, void (*callback)(FILE *out, char *parameters));
++void register_concom(const char *name, enum operation_mode o, int parameters, const char *text, void (*callback)(FILE *out, char *parameters));
+ 
+ /* Register options that can be enabled via the "enable" command on the CLI or on the command line */
+-void register_enable(const char *name, bool runtime, bool  *bool_flag, int *int_flag, const char *on_value, const char *off_value, void (*callback)(void), const char *description);
++void register_enable(const char *name, enum operation_mode o, bool  *bool_flag, int *int_flag, const char *on_value, const char *off_value, void (*callback)(void), const char *description);
+ 
+ /* Register commandline options */
+-void register_option(const char  *name, int has_arg, const char x, void (*callback)(char *optarg), const char *pardesc, const char *description);
++void register_option(const char  *name, enum operation_mode o, const char x, void (*callback)(char *optarg), const char *pardesc, const char *description);
+ 
+ void enable(FILE *out, char *option, bool enable);
+ 
+Index: rdma-core/ib2roce/endpoint.c
+===================================================================
+--- rdma-core.orig/ib2roce/endpoint.c
++++ rdma-core/ib2roce/endpoint.c
+@@ -593,5 +593,6 @@ struct rdma_unicast *new_rdma_unicast(st
+ __attribute__((constructor))
+ static void endpoint_init(void)
+ {
+-	register_concom("endpoints", true, 0, "List Endpoints", endpoints_cmd);
++	register_concom("endpoints", flag_prompt | mode_bridge | mode_listen | mode_sender,
++			0, "List Endpoints", endpoints_cmd);
+ }
+Index: rdma-core/ib2roce/interfaces.c
+===================================================================
+--- rdma-core.orig/ib2roce/interfaces.c
++++ rdma-core/ib2roce/interfaces.c
+@@ -1356,7 +1356,8 @@ static void roce_set(char *optarg)
+ __attribute__ ((constructor))
+ static void interfaces_init(void)
+ {
+-	register_concom("interfaces", true, 1, "List statistics about Interfaces", interfaces_cmd);
++	register_concom("interfaces", flag_prompt | mode_bridge | mode_listen | mode_sender,
++			1, "List statistics about Interfaces", interfaces_cmd);
+ 	register_option("device", required_argument, 'd', device_set,
+ 		"<if[:portnumber][/<netdev>]", "Infiniband device. Uses the first available if not specified");
+ 	register_option("roce", required_argument, 'r', roce_set,
+Index: rdma-core/ib2roce/logging.c
+===================================================================
+--- rdma-core.orig/ib2roce/logging.c
++++ rdma-core/ib2roce/logging.c
+@@ -319,8 +319,10 @@ static void systemd_set(char *optarg)
+ __attribute__((constructor))
+ static void logging_init(void)
+ {
+-	register_concom("continuous", false, 1,	"Print continous status in specified interval",	continous_cmd);
+-	register_concom("status", true, 0, "Print a brief status", statuscmd);
++	register_concom("continuous", mode_bridge | mode_listen | mode_sender,
++			1,	"Print continous status in specified interval",	continous_cmd);
++	register_concom("status", flag_prompt | mode_bridge | mode_listen | mode_sender,
++			0, "Print a brief status", statuscmd);
+ 	register_enable("loglevel", true, NULL, &loglevel, "5","3", NULL,
+ 		"Log output to console (0=EMERG, 1=ALERT, 2=CRIT, 3=ERR, 4=WARN, 5=NOTICE, 6=INFO, 7=DEBUG)");
+ 	register_option("verbose", no_argument, 'v', verbose_set, NULL, "Increase logging detail");
+Index: rdma-core/ib2roce/multicast.c
+===================================================================
+--- rdma-core.orig/ib2roce/multicast.c
++++ rdma-core/ib2roce/multicast.c
+@@ -691,7 +691,8 @@ static void outbound_set(char *optarg)
+ __attribute__((constructor))
+ static void multicast_init(void)
+ {
+-	register_concom("multicast", true, 0, "List Multicast groups and their status", multicast_cmd);
++	register_concom("multicast", flag_prompt | mode_bridge | mode_listen | mode_sender,
++			0, "List Multicast groups and their status", multicast_cmd);
+ 	register_option("mgid", optional_argument, 'l', mgid_set,
+ 			"<format>","Set default MGID format/List formats");
+ 	register_option("tos", required_argument, 't', tos_set,
+Index: rdma-core/ib2roce/pgm.c
+===================================================================
+--- rdma-core.orig/ib2roce/pgm.c
++++ rdma-core/ib2roce/pgm.c
+@@ -523,7 +523,7 @@ static void tsi_cmd(FILE *out, char *par
+ __attribute__((constructor))
+ static void pgm_init(void)
+ {
+-	register_concom("tsi", true, 0, "Show PGM info", tsi_cmd);
++	register_concom("tsi", flag_prompt | mode_bridge | mode_listen, 0, "Show PGM info", tsi_cmd);
+ 	register_enable("pgm", true, NULL, (int *)&pgm_mode, "2", "off", NULL,
+ 		"PGM processing mode (0=None, 1= verify source address, 2=Passtrough, 3=DLR, 4=Resend with new TSI");
+ 

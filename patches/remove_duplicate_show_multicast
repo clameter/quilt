@@ -1,0 +1,54 @@
+Index: rdma-core/ib2roce/interfaces.c
+===================================================================
+--- rdma-core.orig/ib2roce/interfaces.c
++++ rdma-core/ib2roce/interfaces.c
+@@ -1083,7 +1083,7 @@ struct i2r_interface *find_interface(str
+ 	return NULL;
+ }
+ 
+-static unsigned show_interfaces(char *b)
++unsigned show_interfaces(char *b)
+ {
+ 	struct i2r_interface *i;
+ 	int n = 0;
+Index: rdma-core/ib2roce/interfaces.h
+===================================================================
+--- rdma-core.orig/ib2roce/interfaces.h
++++ rdma-core/ib2roce/interfaces.h
+@@ -151,4 +151,6 @@ void setup_interface(enum interfaces);
+ void shutdown_ib(void);
+ void shutdown_roce(void);
+ 
++unsigned show_interfaces(char *b);
++
+ #endif
+Index: rdma-core/ib2roce/ib2roce.c
+===================================================================
+--- rdma-core.orig/ib2roce/ib2roce.c
++++ rdma-core/ib2roce/ib2roce.c
+@@ -1200,25 +1200,6 @@ discard:
+ 
+ static int status_fd;
+ 
+-static unsigned show_interfaces(char *b)
+-{
+-	struct i2r_interface *i;
+-	int n = 0;
+-
+-
+-	for(i = i2r; i < i2r + NR_INTERFACES; i++) {
+-
+-		if (i->multicast)
+-			n += channel_stats(b + n, i->multicast, i->text, "Multicast");
+-		if (i->ud)
+-			n += channel_stats(b + n, i->ud, i->text, "UD");
+-		if (i->raw)
+-			n += channel_stats(b + n, i->raw, i->text, "Raw");
+-
+-	}
+-	return n;
+-}
+-
+ static unsigned show_multicast(char *b)
+ {
+ 	int n = 0;

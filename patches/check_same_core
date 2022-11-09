@@ -1,0 +1,107 @@
+Index: rdma-core/ib2roce/ib2roce.c
+===================================================================
+--- rdma-core.orig/ib2roce/ib2roce.c
++++ rdma-core/ib2roce/ib2roce.c
+@@ -264,6 +264,12 @@ void receive_multicast(struct buf *buf)
+ 	struct mc_interface *mi = m->interface  + (in ^ 1);
+ 	struct rdma_channel *ch_out = mi->channel;
+ 
++	if (!m->same_core) {
++		/* Ok we need to queue on another core */
++		fifo_put(&ch_out->send_queue, buf);
++		goto success;
++	}
++
+ 	if (mi->packet_time) {
+ 		uint64_t t;
+ 
+@@ -310,6 +316,7 @@ delayed_packet:
+  	if (ret)
+ 		return;
+ 
++success:
+ 	st(c, packets_bridged);
+ 	return;
+ 
+Index: rdma-core/ib2roce/interfaces.c
+===================================================================
+--- rdma-core.orig/ib2roce/interfaces.c
++++ rdma-core/ib2roce/interfaces.c
+@@ -676,7 +676,7 @@ void handle_rdma_event(void *private)
+ 
+ 				/* Things actually work if both multicast groups are joined */
+ 				if (!bridging || m->interface[in^1].status == MC_JOINED)
+-			       		next_join_complete();
++					next_join_complete(m);
+ 
+ 			}
+ 			break;
+@@ -1092,10 +1092,10 @@ void scan_cqs(void *private)
+ 	struct ibv_wc wc[10];
+ 
+ 	for(i = 0; i < core->nr_channels; i++) {
+-		cqs = ibv_poll_cq(core->channel[i]->cq, 10, wc);
+-		if (cqs) {
+-			c = core->channel[i];
++		struct rdma_channel *c = core->channel[i];
+ 
++		cqs = ibv_poll_cq(c->cq, 10, wc);
++		if (cqs) {
+ 			if (cqs > 0)
+ 				process_cqes(c, wc, cqs);
+ 			else {
+@@ -1105,6 +1105,8 @@ void scan_cqs(void *private)
+ 				continue;
+ 			}
+ 		}
++		if (!fifo_empty(&c->send_queue))
++			send_pending_buffers(c);
+ 	}
+ }
+ 
+Index: rdma-core/ib2roce/interfaces.h
+===================================================================
+--- rdma-core.orig/ib2roce/interfaces.h
++++ rdma-core/ib2roce/interfaces.h
+@@ -165,7 +165,7 @@ struct i2r_interface *find_interface(str
+ struct rdma_channel *find_channel(struct i2r_interface *i, enum channel_type type);
+ 
+ void check_joins(struct channel_list *infiniband, struct channel_list *roce);
+-void next_join_complete(void);
++void next_join_complete(struct mc *);
+ 
+ void check_out_of_buffer(void *);
+ 
+Index: rdma-core/ib2roce/multicast.c
+===================================================================
+--- rdma-core.orig/ib2roce/multicast.c
++++ rdma-core/ib2roce/multicast.c
+@@ -542,10 +542,15 @@ static void send_joins(void)
+  * RDMA handler event occurred that completed the next join
+  * for a couple of multicast groups
+  */
+-void next_join_complete(void)
++void next_join_complete(struct mc *m)
+ {
+ 	struct i2r_interface *i;
+ 
++	if (m->interface[ROCE].channel->core == m->interface[INFINIBAND].channel->core)
++		m->same_core = true;
++	else
++		logg(LOG_WARNING, "MC %s in and out channel not on the same core\n", inet_ntoa(m->addr));
++
+ 	active_mc++;
+ 	if (active_mc < nr_mc)
+ 		return;
+Index: rdma-core/ib2roce/multicast.h
+===================================================================
+--- rdma-core.orig/ib2roce/multicast.h
++++ rdma-core/ib2roce/multicast.h
+@@ -102,6 +102,7 @@ struct mc {
+ 	uint8_t mgid_mode;
+ 	bool enabled;				/* Are we handling traffic? */
+ 	bool admin;				/* Administrative group */
++	bool same_core;				/* both interfaces on the same core */
+ 	uint16_t port;
+ 	const char *text;
+ };

@@ -1,0 +1,123 @@
+Index: rdma-core/ib2roce/buffers.h
+===================================================================
+--- rdma-core.orig/ib2roce/buffers.h
++++ rdma-core/ib2roce/buffers.h
+@@ -113,10 +113,6 @@ static inline void pull(struct buf *buf,
+ 
+ #define PULL(__BUF, __VAR) pull(__BUF, &(__VAR), sizeof(__VAR))
+ 
+-#ifdef UNICAST
+-static int send_buf(struct buf *buf, struct rdma_unicast *ra);
+-#endif
+-
+ extern struct buf *buffers;
+ 
+ extern struct buf *nextbuffer;	/* Pointer to next available RDMA buffer */
+@@ -168,10 +164,8 @@ int send_to(struct rdma_channel *c,
+ 	bool imm_used, unsigned imm,
+ 	struct buf *buf);
+ 
+-struct rdma_unicast;
+ struct i2r_interface;
+ 
+-int send_buf(struct buf *buf, struct rdma_unicast *ra);
+ void send_buf_to(struct i2r_interface *i, struct buf *buf, struct sockaddr_in *sin);
+ 
+ int send_pending_buffers(struct rdma_channel *c);
+Index: rdma-core/ib2roce/channel.c
+===================================================================
+--- rdma-core.orig/ib2roce/channel.c
++++ rdma-core/ib2roce/channel.c
+@@ -213,7 +213,7 @@ err:
+ 
+ static bool loopback_blocking = true;	/* Ask for loopback blocking on Multicast QPs */
+ 
+-static int allocate_rdmacm_qp(struct rdma_channel *c, bool multicast)
++int allocate_rdmacm_qp(struct rdma_channel *c, bool multicast)
+ {
+ 	struct ibv_qp_init_attr_ex init_qp_attr_ex;
+ 	int ret;
+Index: rdma-core/ib2roce/channel.h
+===================================================================
+--- rdma-core.orig/ib2roce/channel.h
++++ rdma-core/ib2roce/channel.h
+@@ -162,6 +162,8 @@ void calculate_pps(void *private);
+ 
+ void show_core_config(void);
+ 
++int allocate_rdmacm_qp(struct rdma_channel *c, bool multicast);
++
+ receive_callback receive_multicast;
+ 
+ #ifdef UNICAST
+Index: rdma-core/ib2roce/endpoint.c
+===================================================================
+--- rdma-core.orig/ib2roce/endpoint.c
++++ rdma-core/ib2roce/endpoint.c
+@@ -497,7 +497,7 @@ static unsigned show_endpoints(char *b)
+ 
+ static void resolve_start(struct rdma_unicast *);
+ 
+-static void zap_channel(struct rdma_unicast *ru)
++void zap_channel(struct rdma_unicast *ru)
+ {
+ 	struct buf *buf;
+ 
+@@ -514,7 +514,7 @@ static void zap_channel(struct rdma_unic
+ }
+ 
+ /* Drop the first entry from the list of items to resolve */
+-static void resolve_end(struct rdma_unicast *ru)
++void resolve_end(struct rdma_unicast *ru)
+ {
+ 	struct i2r_interface *i = ru->i;
+ 
+@@ -546,7 +546,7 @@ static void resolve_start(struct rdma_un
+ 		sin->sin_family = AF_INET;
+ 		sin->sin_addr = i->if_addr.sin_addr;
+ 		sin->sin_port = 0;
+-		ru->c = new_rdma_channel(i, channel_incoming, "in");
++		ru->c = new_rdma_channel(i, channel_incoming, 0);
+ 		ru->c->ru = ru;
+ 	}
+ 
+Index: rdma-core/ib2roce/endpoint.h
+===================================================================
+--- rdma-core.orig/ib2roce/endpoint.h
++++ rdma-core/ib2roce/endpoint.h
+@@ -102,9 +102,11 @@ struct rdma_unicast {
+ 	struct hash_item hash[nr_hashes];
+ };
+ 
+-struct rdma_unicast *new_rdma_unicast(struct i2r_interface *i, struct sockaddr_in *sin);
+ 
++struct rdma_unicast *new_rdma_unicast(struct i2r_interface *i, struct sockaddr_in *sin);
++void resolve_end(struct rdma_unicast *);
+ void resolve(struct rdma_unicast *ru);
++void zap_channel(struct rdma_unicast *ru);
+ 
+ 
+ static inline bool multicast_lid(uint16_t lid) {
+@@ -116,6 +118,9 @@ static inline bool unicast_lid(uint16_t
+ }
+ 
+ void learn_source_address(struct buf *buf);
++
++int send_buf(struct buf *buf, struct rdma_unicast *ra);
++
+ struct endpoint *ip_to_ep(struct i2r_interface *i, struct in_addr addr);
+ struct endpoint *buf_to_ep(struct buf *buf, struct in_addr addr);
+ 
+Index: rdma-core/ib2roce/interfaces.c
+===================================================================
+--- rdma-core.orig/ib2roce/interfaces.c
++++ rdma-core/ib2roce/interfaces.c
+@@ -760,7 +760,7 @@ void handle_rdma_event(void *private)
+ 		case RDMA_CM_EVENT_CONNECT_REQUEST:
+ 			{
+ 				struct rdma_conn_param rcp = { };
+-				struct rdma_channel *c = new_rdma_channel(i, channel_rdmacm);
++				struct rdma_channel *c = new_rdma_channel(i, channel_rdmacm, 0);
+ 
+ 				logg(LOG_NOTICE, "RDMA_CM_CONNECT_REQUEST id=%p listen_id=%p\n",
+ 					event->id, event->listen_id);

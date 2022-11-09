@@ -1,0 +1,192 @@
+Index: rdma-core/ib2roce/ib2roce.c
+===================================================================
+--- rdma-core.orig/ib2roce/ib2roce.c
++++ rdma-core/ib2roce/ib2roce.c
+@@ -65,6 +65,7 @@
+ #include "beacon.h"
+ #include "cli.h"
+ #include "pgm.h"
++#include "sender.h"
+ 
+ #ifdef UNICAST
+ #include "endpoint.h"
+@@ -564,6 +565,8 @@ int main(int argc, char **argv)
+ 
+ 	beacon_setup();
+ 
++	if (mode == mode_sender)
++		sender_setup();
+ 
+ 	post_receive_buffers();
+ 
+@@ -581,6 +584,10 @@ int main(int argc, char **argv)
+ 		sd_notify(0, "STOPPING=1");
+ 
+ 	beacon_shutdown();
++
++	if (mode == mode_sender)
++		sender_shutdown();
++
+ 	stop_cores();
+ 
+ 	shutdown_roce();
+Index: rdma-core/ib2roce/CMakeLists.txt
+===================================================================
+--- rdma-core.orig/ib2roce/CMakeLists.txt
++++ rdma-core/ib2roce/CMakeLists.txt
+@@ -16,6 +16,7 @@ rdma_sbin_executable(ib2roce
+   interfaces.c
+   cli.c
+   pgm.c
++  sender.c
+ )
+ target_link_libraries(ib2roce LINK_PRIVATE
+   ibverbs
+Index: rdma-core/ib2roce/sender.c
+===================================================================
+--- /dev/null
++++ rdma-core/ib2roce/sender.c
+@@ -0,0 +1,90 @@
++/*
++ * IB2ROCE Sender support
++ *
++ * (C) 2022 Christoph Lameter <cl@linux.com>
++ *
++ * This software is available to you under a choice of one of two
++ * licenses.  You may choose to be licensed under the terms of the GNU
++ * General Public License (GPL) Version 2, available from the file
++ * COPYING in the main directory of this source tree, or the
++ * OpenIB.org BSD license below:
++ *
++ *     Redistribution and use in source and binary forms, with or
++ *     without modification, are permitted provided that the following
++ *     conditions are met:
++ *
++ *      - Redistributions of source code must retain the above
++ *        copyright notice, this list of conditions and the following
++ *        disclaimer.
++ *
++ *      - Redistributions in binary form must reproduce the above
++ *        copyright notice, this list of conditions and the following
++ *        disclaimer in the documentation and/or other materials
++ *        provided with the distribution.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++ * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
++ * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
++ * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
++ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ *
++ * $Author: Christoph Lameter [cl@linux.com]$
++ *
++ */
++
++#include "interfaces.h"
++#include "sender.h"
++#include "cli.h"
++
++unsigned sendrate = 5;
++unsigned sendbatch = 1;
++unsigned sendlen = 1024;
++
++#define MAX_SENDRATE 10000
++
++void sender_setup(void)
++{
++}
++
++void sender_shutdown(void)
++{
++}
++
++static void sender_cmd(FILE *out, char *parameters)
++{
++	interface_foreach(i) {
++//		fprintf(out, "%s: TSIs=%d\n", i->text, i->nr_tsi);
++//		/* Retrieve TSI streams */
++//		struct pgm_stream *t[10];
++//		unsigned nr;
++//		unsigned offset = 0;
++//
++//		while ((nr = hash_get_objects(i->pgm_tsi_hash, offset, 10, (void **)t))) {
++//			for(int j = 0; j < nr; j++) {
++//				struct pgm_stream *ps = t[j];
++//				char buf[60];
++//
++//				format_tsi(buf, &ps->tsi);
++//
++//				fprintf(out, "%s: lead=%d trail=%d last=%d lastRepairData=%d oldest=%d\n",
++//					buf, ps->lead, ps->trail, ps->last, ps->rlast, ps->oldest);
++// 			}
++//			offset += nr;
++//		}
++	}
++}
++
++__attribute__((constructor))
++static void pgm_init(void)
++{
++	register_enable("sendrate", true, NULL, (int *)&sendrate, "2", "off", NULL,
++		"The rate of sending packets when requested");
++	register_enable("sendlen", true, NULL, (int *)&sendlen, "2", "off", NULL,
++		"The length of the packets being sent");
++	register_enable("sendbatch", true, NULL, (int *)&sendbatch, "2", "off", NULL,
++		"Number of packets to send in one batch");
++}
++
+Index: rdma-core/ib2roce/sender.h
+===================================================================
+--- /dev/null
++++ rdma-core/ib2roce/sender.h
+@@ -0,0 +1,48 @@
++#ifndef IB2ROCE_SENDER
++#define IB2ROCE_SENDER
++/*
++ * IB2ROCE Sender support
++ *
++ * (C) 2022 Christoph Lameter <cl@linux.com>
++ *
++ * This software is available to you under a choice of one of two
++ * licenses.  You may choose to be licensed under the terms of the GNU
++ * General Public License (GPL) Version 2, available from the file
++ * COPYING in the main directory of this source tree, or the
++ * OpenIB.org BSD license below:
++ *
++ *     Redistribution and use in source and binary forms, with or
++ *     without modification, are permitted provided that the following
++ *     conditions are met:
++ *
++ *      - Redistributions of source code must retain the above
++ *        copyright notice, this list of conditions and the following
++ *        disclaimer.
++ *
++ *      - Redistributions in binary form must reproduce the above
++ *        copyright notice, this list of conditions and the following
++ *        disclaimer in the documentation and/or other materials
++ *        provided with the distribution.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++ * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
++ * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
++ * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
++ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ *
++ * $Author: Christoph Lameter [cl@linux.com]$
++ *
++ */
++
++#include "channel.h"
++#include "multicast.h"
++#include "buffers.h"
++
++void sender_setup(void);
++
++void sender_shutdown(void);
++
++#endif

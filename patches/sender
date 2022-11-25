@@ -10,6 +10,24 @@ Index: rdma-core/ib2roce/ib2roce.c
  
  #ifdef UNICAST
  #include "endpoint.h"
+@@ -175,7 +176,7 @@ void receive_multicast(struct buf *buf)
+ 			goto discardit;
+ 		}
+ 
+-		if (buf->ip.saddr == c->i->if_addr.sin_addr.s_addr) {
++		if (buf->ip.saddr == c->i->if_addr.sin_addr.s_addr && buf->w->qp_num == buf->w->src_qp) {
+ 			reason = "Loopback Packet";
+ 			goto discardit;
+ 		}
+@@ -193,7 +194,7 @@ void receive_multicast(struct buf *buf)
+ 			goto discardit;
+ 		}
+ 
+-		if (memcmp(&buf->grh.sgid, &c->i->gid, sizeof(union ibv_gid)) == 0) {
++		if (memcmp(&buf->grh.sgid, &c->i->gid, sizeof(union ibv_gid)) == 0 && buf->w->qp_num == buf->w->src_qp) {
+ 
+ 			reason = "Loopback Packet";
+ 			goto discardit;
 @@ -564,6 +565,8 @@ int main(int argc, char **argv)
  
  	beacon_setup();
@@ -46,7 +64,7 @@ Index: rdma-core/ib2roce/sender.c
 ===================================================================
 --- /dev/null
 +++ rdma-core/ib2roce/sender.c
-@@ -0,0 +1,90 @@
+@@ -0,0 +1,155 @@
 +/*
 + * IB2ROCE Sender support
 + *
@@ -84,51 +102,116 @@ Index: rdma-core/ib2roce/sender.c
 + *
 + */
 +
++#include <unistd.h>
++
 +#include "interfaces.h"
 +#include "sender.h"
 +#include "cli.h"
 +
-+unsigned sendrate = 5;
-+unsigned sendbatch = 1;
-+unsigned sendlen = 1024;
++static unsigned sendrate = 5;
++static unsigned sendbatch = 1;
++static unsigned sendlen = 1024;
++
++static uint64_t sender_interval;
++static unsigned sender_seq = 1;
++
++static unsigned sessionid;
++static char hostname[40];
 +
 +#define MAX_SENDRATE 10000
 +
-+void sender_setup(void)
++struct sender_info {
++	unsigned signature;
++	unsigned sessionid;
++	uint64_t timestamp;
++	unsigned sqn;
++	char name[40];
++	char dummy[];
++};
++
++#define SENDER_SIGNATURE 0xD3ADB33F
++
++static void prep_sender_struct(struct i2r_interface *i, struct buf *buf)
 +{
++	struct sender_info *b = (void *)buf->raw;
++
++	/* Max MTU is 4096 bytes */
++	if (sendlen > 4096)
++		abort();
++
++
++	memset(buf->raw, 0, sendlen);
++
++	b->signature = SENDER_SIGNATURE;
++	memcpy(b->name, hostname, sizeof(hostname));
++	b->sessionid = sessionid;
++
++	b->timestamp = now;
++	b->sqn = sender_seq;
++	buf->end = buf->raw + sendlen;
++}
++
++static void sender_send(void *private)
++{
++	struct buf *buf;
++	struct i2r_interface *i = i2r + default_interface;
++
++	if (!sender_interval || !i->context)
++		return;
++
++	for(int j = 0; j < sendbatch; j++) {
++
++		now = timestamp();
++
++		/* scan through all multicast groups and send */
++		mc_foreach(m) {
++			struct rdma_channel *c = m->interface[default_interface].channel;
++
++			if (m->interface[default_interface].status != MC_JOINED)
++				continue;
++
++			buf = alloc_buffer(c);
++			prep_sender_struct(i, buf);
++			send_to(c, buf->raw, buf->end - buf->raw, &m->interface[default_interface].ai, false, 0, buf);
++		}
++		sender_seq++;
++	}
++
++	add_event(timestamp() + sender_interval, sender_send, NULL, "Sender Send");
 +}
 +
 +void sender_shutdown(void)
 +{
-+}
-+
-+static void sender_cmd(FILE *out, char *parameters)
-+{
-+	interface_foreach(i) {
-+//		fprintf(out, "%s: TSIs=%d\n", i->text, i->nr_tsi);
-+//		/* Retrieve TSI streams */
-+//		struct pgm_stream *t[10];
-+//		unsigned nr;
-+//		unsigned offset = 0;
-+//
-+//		while ((nr = hash_get_objects(i->pgm_tsi_hash, offset, 10, (void **)t))) {
-+//			for(int j = 0; j < nr; j++) {
-+//				struct pgm_stream *ps = t[j];
-+//				char buf[60];
-+//
-+//				format_tsi(buf, &ps->tsi);
-+//
-+//				fprintf(out, "%s: lead=%d trail=%d last=%d lastRepairData=%d oldest=%d\n",
-+//					buf, ps->lead, ps->trail, ps->last, ps->rlast, ps->oldest);
-+// 			}
-+//			offset += nr;
-+//		}
++	if (sender_interval) {
++		sender_interval = 0;
++		sender_send(NULL);		/* Argh... Race condition */
 +	}
 +}
 +
-+__attribute__((constructor))
-+static void pgm_init(void)
++void sender_setup(void)
 +{
++	if (sendrate > 1000 || !sendrate) {
++		logg(LOG_ERR, "Cannot send more than 1000 batches per second\n");
++		return;
++	}
++
++	sender_interval = ONE_SECOND / sendrate;
++
++	if (!sender_interval)
++		return;
++
++	add_event(timestamp() + ONE_SECOND + rand() % sender_interval,
++			sender_send, NULL, "Sender Send");
++}
++
++__attribute__((constructor))
++static void sender_init(void)
++{
++	srand(time(NULL));
++	sessionid = rand();
++	if (gethostname(hostname, sizeof(hostname)) < 0)
++			logg(LOG_CRIT, "Cannot determine hostname: %s\n", errname());
++
 +	register_enable("sendrate", true, NULL, (int *)&sendrate, "2", "off", NULL,
 +		"The rate of sending packets when requested");
 +	register_enable("sendlen", true, NULL, (int *)&sendlen, "2", "off", NULL,

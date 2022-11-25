@@ -55,7 +55,7 @@ Index: rdma-core/ib2roce/interfaces.c
 ===================================================================
 --- rdma-core.orig/ib2roce/interfaces.c
 +++ rdma-core/ib2roce/interfaces.c
-@@ -1021,7 +1021,6 @@ static void process_cqes(struct rdma_cha
+@@ -1017,7 +1017,6 @@ static void process_cqes(struct rdma_cha
  		if (w->status == IBV_WC_SUCCESS && w->opcode == IBV_WC_RECV) {
  
  			c->active_receive_buffers--;
@@ -63,7 +63,7 @@ Index: rdma-core/ib2roce/interfaces.c
  
  			if (c != buf->c) {
  				logg(LOG_CRIT, "%s: RDMA Channel mismatch CQE is from %s.\n", c->text, buf->c->text);
-@@ -1061,14 +1060,28 @@ static void process_cqes(struct rdma_cha
+@@ -1057,14 +1056,28 @@ static void process_cqes(struct rdma_cha
  
  			buf->ip_csum_ok = (w->wc_flags & IBV_WC_IP_CSUM_OK) != 0;
  

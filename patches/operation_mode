@@ -27,6 +27,15 @@ Index: rdma-core/ib2roce/cli.c
  	fprintf(out, "Command		Description\n");
  	fprintf(out, "----------------------------------------\n");
  
+@@ -94,7 +103,7 @@ static void exitcmd(FILE *out, char *par
+ 
+ static void prompt(void *private)
+ {
+-	printf("ib2roce-$ ");
++	printf("%s-$ ", mode_text[mode]);
+ 	fflush(stdout);
+ };
+ 
 @@ -319,6 +328,26 @@ void parse_options(int argc, char **argv
  	int op;
  	int i;
@@ -54,7 +63,7 @@ Index: rdma-core/ib2roce/cli.c
  	/* Compose opt_string from opts */
  	p = opt_string;
  	for(i = 0; i < 128; i++) {
-@@ -413,8 +442,8 @@ static void help_opt(char *optarg)
+@@ -409,8 +438,8 @@ static void help_opt(char *optarg)
  {
  	int i;
  
@@ -65,7 +74,7 @@ Index: rdma-core/ib2roce/cli.c
  
  	for(i = 0; i < 128; i++) {
  		struct opts_data *od = opts_datas + i;
-@@ -451,7 +480,7 @@ static void opts_init(void)
+@@ -447,7 +476,7 @@ static void opts_init(void)
  	register_option("help", no_argument, 'h', help_opt, NULL, "Show these instructions");
  
  	register_concom("help",	true,	0,	"Print a list of commands",			help );

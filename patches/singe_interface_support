@@ -46,7 +46,7 @@ Index: rdma-core/ib2roce/interfaces.c
  static int mc_per_qp = 0;	/* 0 = Unlimited */
  
  struct i2r_interface i2r[NR_INTERFACES];
-@@ -251,12 +253,13 @@ int find_rdma_devices(void)
+@@ -247,12 +249,13 @@ int find_rdma_devices(void)
  	skip:
  		if (!found)
  			ibv_close_device(c);
@@ -62,7 +62,7 @@ Index: rdma-core/ib2roce/interfaces.c
  	if (!i2r[ROCE].context) {
  
  		if (roce_name && roce_name[0] == '-')
-@@ -270,7 +273,9 @@ int find_rdma_devices(void)
+@@ -266,7 +269,9 @@ int find_rdma_devices(void)
  			/* There is no ROCE device so we cannot bridge */
  			bridging = false;
  		}
@@ -73,7 +73,7 @@ Index: rdma-core/ib2roce/interfaces.c
  
  	if (!i2r[INFINIBAND].context) {
  
-@@ -282,7 +287,7 @@ int find_rdma_devices(void)
+@@ -278,7 +283,7 @@ int find_rdma_devices(void)
  				/* User specd IB device */
  				logg(LOG_EMERG, "Infiniband device %s not found.\n", ib_name);
  			else {
@@ -82,7 +82,7 @@ Index: rdma-core/ib2roce/interfaces.c
  					logg(LOG_EMERG, "No RDMA Devices available.\n");
  					return 1;
  				}
-@@ -290,7 +295,9 @@ int find_rdma_devices(void)
+@@ -286,7 +291,9 @@ int find_rdma_devices(void)
  				bridging = false;
  			}
  		}
@@ -92,17 +92,4 @@ Index: rdma-core/ib2roce/interfaces.c
 +			default_interface = INFINIBAND;
  	return 0;
  }
- 
-Index: rdma-core/ib2roce/cli.c
-===================================================================
---- rdma-core.orig/ib2roce/cli.c
-+++ rdma-core/ib2roce/cli.c
-@@ -103,7 +103,7 @@ static void exitcmd(FILE *out, char *par
- 
- static void prompt(void *private)
- {
--	printf("ib2roce-$ ");
-+	printf("%s-$ ", mode_text[mode]);
- 	fflush(stdout);
- };
  

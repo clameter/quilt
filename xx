@@ -1,0 +1,79 @@
+diff --git a/ib2roce/logging.c b/ib2roce/logging.c
+index 703f6335..24ac8a3c 100644
+--- a/ib2roce/logging.c
++++ b/ib2roce/logging.c
+@@ -202,7 +202,7 @@ void brief_status(FILE *out)
+ 	if (n == 0) {
+ 		events = "No upcoming events";
+ 	} else {
+-		snprintf(buf2, sizeof(buf2), "Events in %s", buf);
++		snprintf(buf2, sizeof(buf2), "Events: %s", buf);
+ 		events = buf2;
+ 	}
+ 
+@@ -237,9 +237,9 @@ void brief_status(FILE *out)
+ 	}
+ 
+ 	if (out == stdout)
+-		logg(LOG_NOTICE, "%s. Groups=%d/%d. Packets=%s\n", events, active_mc, nr_mc, counts);
++		logg(LOG_NOTICE, "%s. Groups=%d/%d. Packets=%s", events, active_mc, nr_mc, counts);
+ 	else
+-		fprintf(out, "%s. Groups=%d/%d. Packets=%s\n", events, active_mc, nr_mc, counts);
++		fprintf(out, "%s. Groups=%d/%d. Packets=%s", events, active_mc, nr_mc, counts);
+ 
+ #ifdef UNICAST
+ 	list_endpoints(i2r + INFINIBAND);
+@@ -312,6 +312,11 @@ static void systemd_set(char *optarg)
+ 	systemd = true;
+ }
+ 
++static void continous_set(char *optarg)
++{
++	continous_cmd(stdout, optarg);
++}
++
+ __attribute__((constructor))
+ static void logging_init(void)
+ {
+@@ -321,5 +326,6 @@ static void logging_init(void)
+ 		"Log output to console (0=EMERG, 1=ALERT, 2=CRIT, 3=ERR, 4=WARN, 5=NOTICE, 6=INFO, 7=DEBUG)");
+ 	register_option("verbose", no_argument, 'v', verbose_set, NULL, "Increase logging detail");
+ 	register_option("systemd", no_argument, 's', systemd_set, NULL, "Operate from systemd");
++	register_option("continous", required_argument, '@', continous_set, NULL, "Print continuous status");
+ }
+ 
+diff --git a/ib2roce/sched.c b/ib2roce/sched.c
+index 3d57e160..f435a847 100644
+--- a/ib2roce/sched.c
++++ b/ib2roce/sched.c
+@@ -142,13 +142,29 @@ int64_t time_to_next_event(void)
+ 		return 0;
+ }
+ 
++static char *print_time(uint64_t time)
++{
++	static char buf[20];
++
++	if (time > 10 * ONE_SECOND)
++		sprintf(buf, "%lds", (time + ONE_SECOND /2 ) / ONE_SECOND);
++	else if (time > 10 * ONE_MILLISECOND)
++		sprintf(buf, "%ldms", (time + ONE_MICROSECOND / 2 ) /ONE_MILLISECOND);
++	else if (time > 10 * ONE_MICROSECOND)
++		sprintf(buf, "%ldus", (time + ONE_MICROSECOND / 2 )/ ONE_MICROSECOND);
++	else
++		sprintf(buf, "%ldns", time);
++
++	return buf;
++}
++
+ int get_timer_list(char *buf, char separator)
+ {
+ 	int n = 0;
+ 
+ 	now = timestamp();
+ 	for(struct timed_event *z = next_event; z; z = z->next)
+-		n += sprintf(buf + n, "%ldms%c", z->time > now ? (z->time - now) / ONE_MILLISECOND : 0,  separator);
++		n += sprintf(buf + n, "%s(%s)%c", z->text, print_time(z->time > now ? (z->time - now) : 0),  separator);
+ 
+ 	return n;
+ }

@@ -1,0 +1,24 @@
+Index: rdma-core/ib2roce/interfaces.c
+===================================================================
+--- rdma-core.orig/ib2roce/interfaces.c
++++ rdma-core/ib2roce/interfaces.c
+@@ -1083,6 +1083,10 @@ static void process_cqes(struct rdma_cha
+ 
+ 	/* Since we freed some buffers up we may be able to post more of them */
+ 	post_receive(c);
++
++	/* If we got some completes then we can push more packets into the queue */
++	if (!fifo_empty(&c->send_queue))
++		send_pending_buffers(c);
+ }
+ 
+ 
+@@ -1118,8 +1122,6 @@ void scan_cqs(void *private)
+ 				continue;
+ 			}
+ 		}
+-		if (!fifo_empty(&c->send_queue))
+-			send_pending_buffers(c);
+ 	}
+ }
+ 

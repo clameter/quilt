@@ -1,0 +1,26 @@
+Index: rdma-core/ib2roce/sched.h
+===================================================================
+--- rdma-core.orig/ib2roce/sched.h
++++ rdma-core/ib2roce/sched.h
+@@ -124,6 +124,7 @@ void terminate(int x);
+ /* Get a textual representation of the timers */
+ int get_timer_list(char *b, char separator);
+ 
++char *print_time(uint64_t);
+ void start_cores(void);
+ void stop_cores(void);
+ 
+Index: rdma-core/ib2roce/sender.c
+===================================================================
+--- rdma-core.orig/ib2roce/sender.c
++++ rdma-core/ib2roce/sender.c
+@@ -107,8 +107,8 @@ static void sender_send(void *private)
+ 			prep_sender_struct(i, buf);
+ 			send_to(c, buf->raw, buf->end - buf->raw, &m->interface[default_interface].ai, false, 0, buf);
+ 		}
+-		sender_seq++;
+ 	}
++	sender_seq++;
+ 
+ 	add_event(timestamp() + sender_interval, sender_send, NULL, "Sender Send");
+ }

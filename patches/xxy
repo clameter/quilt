@@ -1,0 +1,44 @@
+Index: rdma-core/ib2roce/buffers.c
+===================================================================
+--- rdma-core.orig/ib2roce/buffers.c
++++ rdma-core/ib2roce/buffers.c
+@@ -37,6 +37,9 @@
+ 
+ #define _GNU_SOURCE
+ 
++#define MAX_BACKLOG 100000
++#define WARN_BACKLOG 10000
++
+ #include "errno.h"
+ #include "locking.h"
+ #include "logging.h"
+@@ -83,7 +86,7 @@ struct buf *alloc_buffer(struct rdma_cha
+ 	do {
+ 		buf = nextbuffer;
+ 		if (!buf)
+-			return NULL;
++			goto oom;
+ 
+ 		next = buf->next;
+ 	} while (!buf_cmpxchg(&nextbuffer, buf, next));
+@@ -100,6 +103,11 @@ struct buf *alloc_buffer(struct rdma_cha
+ 			panic("buffer content not zeroed\n");
+ #endif
+ 	return buf;
++
++oom:
++	logg(LOG_CRIT, "Out of buffers\n");
++	exit(1);
++	return NULL;
+ }
+ 
+ void free_buffer(struct buf *buf)
+@@ -295,7 +303,7 @@ int send_ud(struct rdma_channel *c, stru
+ 
+ 	if (ret) {
+ 		errno = ret;
+-		logg(LOG_WARNING, "Failed to post send: %s on %s. Active Receive Buffers=%d/%d Active Send Buffers=%d\n", errname(), c->text, c->active_receive_buffers, c->nr_receive, c->active_send_buffers);
++		logg(LOG_WARNING, "Failed to post send: %s on %s. Active Receive Buffers=%d/%d Active Send Buffers=%d Packets_sent=%u\n", errname(), c->text, c->active_receive_buffers, c->nr_receive, c->active_send_buffers, c->stats[packets_sent]);
+ 		stop_channel(c);
+ 	} else
+ 		logg(LOG_DEBUG, "RDMA Send to QPN=%d QKEY=%x %d bytes\n",

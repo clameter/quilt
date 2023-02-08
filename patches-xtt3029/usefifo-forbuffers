@@ -1,0 +1,75 @@
+Index: rdma-core/ib2roce/ib2roce.c
+===================================================================
+--- rdma-core.orig/ib2roce/ib2roce.c
++++ rdma-core/ib2roce/ib2roce.c
+@@ -810,7 +810,7 @@ static int send_buf(struct buf *buf, str
+ 
+ static struct buf *buffers;
+ 
+-static struct buf *nextbuffer;	/* Pointer to next available RDMA buffer */
++static struct fifo buffers_fifo;
+ 
+ static void free_buffer(struct buf *buf)
+ {
+@@ -818,8 +818,7 @@ static void free_buffer(struct buf *buf)
+ 	memset(buf->raw, 0, DATA_SIZE);
+ #endif
+ 	buf->free = true;
+-	buf->next = nextbuffer;
+-	nextbuffer = buf;
++	fifo_put(&buffers_fifo, buf);
+ }
+ 
+ /* Remove all buffers related to a channel */
+@@ -844,6 +843,8 @@ static void init_buf(void)
+ 		abort();
+ 	}
+ 
++	fifo_init(&buffers_fifo);
++
+ 	flags = MAP_PRIVATE | MAP_ANONYMOUS;
+ 	if (huge)
+ 		flags |= MAP_HUGETLB;
+@@ -866,16 +867,17 @@ static void init_buf(void)
+ 
+ static struct buf *alloc_buffer(struct rdma_channel *c)
+ {
+-	struct buf *buf = nextbuffer;
++	struct buf * buf = fifo_get(&buffers_fifo);
+ 
+-	if (buf) {
+-		nextbuffer = buf->next;
+-		buf->free = false;
++	if (!c) {
++		logg(LOG_CRIT, "Out of I/O buffers for %s\n", c->text);
++		return NULL;
+ 	}
++
+ 	buf->c = c;
++	buf->free = false;
+ 
+ #ifdef DEBUG
+-	buf->next = NULL;
+ 
+ 	for(uint8_t *q = buf->raw; q < buf->raw + DATA_SIZE; q++)
+ 		if (*q)
+@@ -1008,9 +1010,6 @@ static int post_receive(struct rdma_chan
+ 	struct ibv_sge sge;
+ 	int ret = 0;
+ 
+-	if (!nextbuffer)
+-		return -ENOMEM;
+-
+ 	if (c->active_receive_buffers >= limit)
+ 		return 0;
+ 
+@@ -1049,9 +1048,6 @@ static int post_receive_buffers(struct i
+ {
+ 	int ret = 0;
+ 
+-	if (!nextbuffer)
+-		return -EAGAIN;
+-
+ 	ret = post_receive(i->multicast, i->multicast->nr_cq / 2);
+ 	if (ret)
+ 		goto out;

@@ -1,0 +1,40 @@
+Index: rdma-core/ib2roce/buffers.c
+===================================================================
+--- rdma-core.orig/ib2roce/buffers.c
++++ rdma-core/ib2roce/buffers.c
+@@ -83,7 +83,7 @@ struct buf *alloc_buffer(struct rdma_cha
+ 	do {
+ 		buf = nextbuffer;
+ 		if (!buf)
+-			return NULL;
++			goto oom;
+ 
+ 		next = buf->next;
+ 	} while (!buf_cmpxchg(&nextbuffer, buf, next));
+@@ -100,6 +100,10 @@ struct buf *alloc_buffer(struct rdma_cha
+ 			panic("buffer content not zeroed\n");
+ #endif
+ 	return buf;
++
++oom:
++	panic("Out of Buffers allocating for channel %s\n", c ? c->text : "Unknown");
++	return NULL;
+ }
+ 
+ void free_buffer(struct buf *buf)
+Index: rdma-core/ib2roce/interfaces.c
+===================================================================
+--- rdma-core.orig/ib2roce/interfaces.c
++++ rdma-core/ib2roce/interfaces.c
+@@ -972,11 +972,6 @@ void post_receive(struct rdma_channel *c
+ 
+ 		struct buf *buf = alloc_buffer(c);
+ 
+-		if (!buf) {
+-			logg(LOG_WARNING, "%s: No free buffers left\n", c->text);
+-			return;
+-		}
+-
+ 		/* Use the buffer address for the completion handler */
+ 		recv_wr.wr_id = (uint64_t)buf;
+ 		sge.addr = (uint64_t)buf->raw;

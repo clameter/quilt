@@ -1,0 +1,212 @@
+Index: rdma-core/ib2roce/buffers.c
+===================================================================
+--- rdma-core.orig/ib2roce/buffers.c
++++ rdma-core/ib2roce/buffers.c
+@@ -385,6 +385,21 @@ int send_to(struct rdma_channel *c,
+ 	int ret;
+ 	struct ibv_send_wr *bad_send_wr;
+ 
++	if (c->type == channel_socket) {
++		struct sockaddr_in sin = {
++			.sin_family = AF_INET,
++			.sin_addr = d->ep->addr,
++			.sin_port = htons(d->remote_qpn)
++		};
++
++		ret = sendto(c->fh, buf->cur, buf->end - buf->cur, 0, &sin, sizeof(sin));
++
++		if (ret < 0)
++			logg(LOG_ERR, "%s: Multicast Packet send error\n", c->text);
++
++		return ret;
++	}
++
+ 	if (!ai->ah)
+ 		panic("Send without a route to a destination\n");
+ 
+Index: rdma-core/ib2roce/channel.c
+===================================================================
+--- rdma-core.orig/ib2roce/channel.c
++++ rdma-core/ib2roce/channel.c
+@@ -459,6 +459,100 @@ static bool setup_packet(struct rdma_cha
+ }
+ #endif
+ 
++/* Receive Multicast on regular socket */
++static void handle_receive_socket(void *private)
++{
++	struct rdma_channel *c = private;
++	struct ibv_wc w = {};
++	ssize_t len;
++	struct buf *buf = alloc_buffer(c);
++	struct sockaddr_in sin;
++	struct iovec iov = {
++		.iov_base = buf->raw,
++		.iov_len = DATA_SIZE
++	};
++	struct msghdr control = { };
++	struct msghdr msg = {
++		.msg_name = &sin,
++		.msg_namelen = sizeof(sin),
++		.msg_iov = &iov,
++		.msg_iovlen = 1,
++		.msg_control = &control,
++		.msg_controllen = sizeof(control),
++	};
++	struct cmsghdr *cmsg;
++
++	len = recvmsg(c->fh, &msg, 0);
++
++	if (len < 0) {
++		logg(LOG_ERR, "recv error on %s:%s\n", c->text, errname());
++		free(buf);
++		return;
++	}
++
++	if (len < 10) {
++		logg(LOG_ERR, "Packet size below minimal %ld\n", len);
++		return;
++	}
++
++	st(c, packets_received);
++
++	w.byte_len = len;
++	buf->cur = buf->raw;
++	buf->end = buf->raw + w.byte_len;
++	buf->w = &w;
++	reset_flags(buf);
++
++	for(cmsg = CMSG_FIRSTHDR(&control); cmsg != NULL; cmsg = CMSG_NXTHDR(&control, cmsg)) {
++		if (cmsg->cmsg_level == IPPROTO_IP && cmsg->cmsg_type == IP_PKTINFO) {
++			struct in_pktinfo *in = (void *)CMSG_DATA(cmsg);
++
++			buf->ip_valid = true;
++			memset(&buf->ip, 0, sizeof(buf->ip));
++			buf->ip.daddr = in->ipi_addr.s_addr;
++			buf->ip.saddr = sin.sin_addr.s_addr;
++			buf->ip.tot_len = len;
++		}
++	}
++
++	if (!buf->ip_valid) {
++		logg(LOG_ERR, "%s: Cannot determine source and destination address of message\n", c->text);
++		free(buf);
++		return;
++	}
++	c->receive(buf);
++}
++
++static bool setup_mcsocket(struct rdma_channel *c)
++{
++	struct i2r_interface *i = c->i;
++	int fh;
++	int flag0 = false;
++	int yes = true;
++	struct sockaddr_in sin = i->if_addr;
++
++	fh = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
++	if (fh < 0) {
++		logg(LOG_ERR, "Multicast Socket creation failed for %s:%s\n", i->text, errname());
++		return false;
++	}
++
++	sin.sin_port = 0;
++
++	if (bind(fh, (struct sockaddr *)&sin, sizeof(struct sockaddr_in))) {
++		logg(LOG_ERR, "Cannot bind multicast socket for %s:%s\n", i->text, errname());
++		return NULL;
++	}
++
++	setsockopt(fh, SOL_IP, IP_MULTICAST_ALL, &flag0, sizeof(flag0));
++	setsockopt(fh, SOL_IP, IP_MULTICAST_LOOP, &flag0, sizeof(flag0));
++	setsockopt(fh, IPPROTO_IP, IP_PKTINFO, &yes, sizeof(yes));
++
++	c->fh = fh;
++	register_callback(handle_receive_socket, fh, c);
++	return true;
++}
++
+ struct channel_info channel_infos[nr_channel_types] = {
+ 	{ "multicast",	0, 0,	10000,	1000,	0,		IBV_QPT_UD,		setup_multicast, receive_multicast, channel_err },
+ #ifdef UNICAST
+@@ -469,6 +563,7 @@ struct channel_info channel_infos[nr_cha
+ 	{ "packet",	-1, -1,	0,	0,	0,		0,			setup_packet,	receive_raw,	channel_err },
+ 	{ "incoming",	-1, -1,	100,	50,	0,		0,			setup_incoming,	NULL,		channel_err },
+ #endif
++	{ "socket",	-1, -1, 0,	0,	0,		0,			setup_mcsocket,	receive_multicast,	channel_err },
+ 	{ "error",	-1, -1,	0,	0,	0,		0,			NULL,		NULL,		channel_err },
+ };
+ 
+Index: rdma-core/ib2roce/channel.h
+===================================================================
+--- rdma-core.orig/ib2roce/channel.h
++++ rdma-core/ib2roce/channel.h
+@@ -69,6 +69,7 @@ extern const char *stats_text[nr_stats];
+ enum channel_type { channel_rdmacm, channel_ud, channel_qp1,
+ 	channel_raw, channel_ibraw,
+ 	channel_packet, channel_incoming,
++	channel_socket,
+ 	channel_err, nr_channel_types };
+ 
+ #define NO_CORE (-1)
+Index: rdma-core/ib2roce/interfaces.c
+===================================================================
+--- rdma-core.orig/ib2roce/interfaces.c
++++ rdma-core/ib2roce/interfaces.c
+@@ -294,6 +294,56 @@ int find_rdma_devices(void)
+ 	return 0;
+ }
+ 
++struct ibv_context sock_context = {
++	.device = NULL
++};
++
++static int check_net_device(enum interfaces i, char *name)
++{
++	int fh;
++	struct ifreq ifr;
++	char dev_name[40];
++	int p = 0;
++	char *s;
++
++	if (!name)
++		return 0;
++
++	/* Port / device specified */
++	s = strchr(name, ':');
++	if (s) {
++		/* Portnumber follows device name */
++		p = atoi(s + 1);
++
++		memcpy(dev_name, name, s-name);
++		dev_name[s-name] = 0;
++
++	} else
++		strcpy(dev_name, name);
++
++	fh = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
++	if (fh < 0)
++		goto out;
++
++	memcpy(ifr.ifr_name, dev_name, IFNAMSIZ);
++
++	if (ioctl(fh, SIOCGIFINDEX, &ifr) < 0)
++		goto out;
++
++	close(fh);
++
++	i2r[i].context = &sock_context;
++	i2r[i].port = p;
++	strcpy(i2r[i].if_name, dev_name);
++	i2r[i].rdma_name = i2r[i].if_name;
++	interfaces_text[i] = i2r[i].if_name;
++	return 1;
++
++out:
++	close(fh);
++	return 0;
++}
++
+ static void qp_destroy(struct i2r_interface *i)
+ {
+ #ifdef HAVE_MSTFLINT

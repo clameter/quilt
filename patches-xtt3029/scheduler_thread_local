@@ -1,0 +1,146 @@
+Index: rdma-core/ib2roce/ib2roce.c
+===================================================================
+--- rdma-core.orig/ib2roce/ib2roce.c
++++ rdma-core/ib2roce/ib2roce.c
+@@ -49,6 +49,7 @@
+ #include <fcntl.h>
+ #include <ctype.h>
+ #include <pthread.h>
++#include <threads.h>
+ #include <numa.h>
+ #include <stdatomic.h>
+ #include <arpa/inet.h>
+@@ -406,7 +407,7 @@ static inline void st(struct rdma_channe
+ }
+ 
+ /* Forwards */
+-static void add_event(unsigned long time_in_ms, void (*callback), const char *text);
++static void add_event(uint64_t  when, void (*callback), void *private, const char *text);
+ static struct rdma_unicast *new_rdma_unicast(struct i2r_interface *i, struct sockaddr_in *sin);
+ static void register_callback(void (*callback)(void *), int fd, void *private);
+ static void handle_receive_packet(void *private);
+@@ -5061,9 +5062,12 @@ struct timed_event {
+ 	struct timed_event *next;	/* The following event */
+ };
+ 
+-static struct timed_event *next_event;
++thread_local uint64_t now;		/* We do not want contention on this one */
+ 
+-static void add_event(uint64_t time, void (*callback), const char *text)
++/* Event queues for each of the threads */
++thread_local static struct timed_event *next_event;
++
++static void add_event(uint64_t time, void (*callback), void *private, const char *text)
+ {
+ 	struct timed_event *t;
+ 	struct timed_event *prior = NULL;
+@@ -5072,6 +5076,7 @@ static void add_event(uint64_t time, voi
+ 	new_event = calloc(1, sizeof(struct timed_event));
+ 	new_event->time = time;
+ 	new_event->callback = callback;
++	new_event->private = private;
+ 
+ 	for(t = next_event; t && time > t->time; t = t->next)
+ 		prior = t;
+@@ -5084,6 +5089,37 @@ static void add_event(uint64_t time, voi
+ 		next_event = new_event;
+ }
+ 
++static int64_t time_to_next_event(void)
++{
++	if (next_event)
++		return (long)next_event->time - (long)timestamp();
++	else
++		return 0;
++}
++
++/*
++ * Run the next event if availabe and return the time till the next event
++ * or 0 if there is none
++ */
++static uint64_t run_events(void)
++{
++	while (next_event) {
++		struct timed_event *te = next_event;
++
++		now = timestamp();
++
++		if (te->time > now + ONE_MICROSECOND)
++			return te->time - now;
++	
++		/* Time is up for an event */
++		next_event = te->next;
++		te->callback(te->private);
++		free(te);
++	}
++	return 0;
++}
++
++
+ static void check_joins(void)
+ {
+ 	struct i2r_interface *i;
+@@ -5242,48 +5278,31 @@ static void arm_channels(struct core_inf
+ 
+ static int event_loop(void)
+ {
+-	uint64_t timeout;
++	int64_t timeout;
+ 	int events = 0;
+-	int64_t waitns;
+ 	unsigned long t;
+-
++ 
+ 	arm_channels(NULL);
+ 	setup_timed_events();
+-loop:
+-	timeout = seconds(10);
+-
+-	if (next_event) {
+-		/* Time till next event */
+-		waitns = next_event->time - timestamp();
+ 
++loop:
++	timeout = time_to_next_event();
++	if (timeout) {
+ 		/*
+ 		 * If we come from processing poll events then
+ 		 * give priority to more poll event processing
+ 		 */
+-		if ((waitns <= 0 && events == 0) || waitns < -(long)milliseconds(10)) {
+-			/* Time is up for an event */
+-			struct timed_event *te;
+-
+-			te = next_event;
+-			next_event = next_event->next;
+-			te->callback();
+-			free(te);
+-			goto loop;
+-		}
+-		if (waitns < ONE_MILLISECOND)
+-			/* There is a pending event but we are processing
+-			 * poll events.
+-			 * Make sure we check for more and come back soon
+-			 * after processing additional poll actions
+-			*/
+-			timeout = milliseconds(3);
+-		else
+-			/* Maximum timeout is 10 seconds */
+-			if (waitns < seconds(10))
+-				timeout = waitns;
+-	}
++		if ((timeout <= 0 && events == 0) ||
++			       timeout < -(long)milliseconds(10))
++
++			timeout = run_events();
+ 
+-	events = poll(pfd, poll_items, (timeout + ONE_MILLISECOND/2) / ONE_MILLISECOND);
++	}
++	
++	if (timeout <= 0 || timeout > (long)seconds(10))
++		timeout = seconds(10);
++ 
++ 	events = poll(pfd, poll_items, (timeout + ONE_MILLISECOND/2) / ONE_MILLISECOND);
+ 
+ 	if (terminated)
+ 		goto out;

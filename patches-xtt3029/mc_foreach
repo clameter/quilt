@@ -1,0 +1,83 @@
+Index: rdma-core/ib2roce/multicast.h
+===================================================================
+--- rdma-core.orig/ib2roce/multicast.h
++++ rdma-core/ib2roce/multicast.h
+@@ -109,6 +109,9 @@ struct mc {
+ 
+ extern struct mc mcs[MAX_MC];
+ 
++#define mc_foreach(__m) for(int __i = 0; __i < nr_mc; __i++) for(struct mc *__m = mcs + __i; __m; __m = NULL)
++
++
+ int hash_add_mc(struct mc *m);
+ struct mc *hash_lookup_mc(struct in_addr addr);
+ 
+Index: rdma-core/ib2roce/interfaces.c
+===================================================================
+--- rdma-core.orig/ib2roce/interfaces.c
++++ rdma-core/ib2roce/interfaces.c
+@@ -114,11 +114,7 @@ void set_rate(struct mc *m)
+ 
+ void set_rates(void)
+ {
+-	int j;
+-
+-	for (j = 0; j < nr_mc; j++) {
+-		struct mc *m = mcs + j;
+-
++	mc_foreach(m) {
+ 		set_rate(m);
+ 		set_rate(m);
+ 	}
+Index: rdma-core/ib2roce/multicast.c
+===================================================================
+--- rdma-core.orig/ib2roce/multicast.c
++++ rdma-core/ib2roce/multicast.c
+@@ -434,11 +434,9 @@ static int _leave_mc(struct in_addr addr
+ 
+ int leave_mc(enum interfaces i, struct rdma_channel *c)
+ {
+-	int j;
+ 	int ret;
+ 
+-	for (j = 0; j < nr_mc; j++) {
+-		struct mc *m = mcs + j;
++	mc_foreach(m) {
+ 		struct mc_interface *mi = m->interface + i;
+ 
+ 		if (mi->channel != c)
+@@ -469,11 +467,9 @@ static struct global_join_state {
+  */
+ static void send_joins(void)
+ {
+-	int i;
+ 	enum interfaces in;
+ 
+-	for (i = 0; i < nr_mc; i++) {
+-		struct mc *m = mcs + i;
++	mc_foreach(m) {
+ 		unsigned port = m->port;
+ 
+ 		if (!m->enabled)
+@@ -603,17 +599,17 @@ void check_joins(struct channel_list *in
+ 
+ static void multicast_cmd(FILE *out, char *parameters)
+ {
+-	struct mc *m;
+-
+ 	now = timestamp();
+ 
+ 	fprintf(out, "Multicast: Active=%u NR=%u Max=%u\n", active_mc, nr_mc, MAX_MC);
+ 
+-	for(m = mcs; m < mcs + nr_mc; m++) {
+-
++	mc_foreach(m) {
+ 		for(enum interfaces in = INFINIBAND; in <= ROCE; in++) {
+ 			struct mc_interface *mi = m->interface + in;
+ 
++			if (mi->status == MC_OFF)
++				continue;
++
+ 			fprintf(out, "%s %s %s %s %s ", mi->channel ? mi->channel->text : interfaces_text[in], m->text,
+ 				mc_text[mi->status],
+ 				mi->sendonly ? "Sendonly" : "",

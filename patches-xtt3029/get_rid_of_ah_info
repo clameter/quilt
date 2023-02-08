@@ -1,0 +1,231 @@
+Index: rdma-core/ib2roce/ib2roce.c
+===================================================================
+--- rdma-core.orig/ib2roce/ib2roce.c
++++ rdma-core/ib2roce/ib2roce.c
+@@ -334,6 +334,24 @@ struct endpoint {
+ 	struct forward *forwards;
+ };
+ 
++/*
++ * A destination on an endpoint which can be addressed
++ * through a QP and requires a QKEY. A port number is
++ * usually used for non RDMA dests so include that too
++ */
++struct dest {
++	struct endpoint *ep;
++	uint32_t remote_qpn;	/* Address on the Endpoint */
++	uint32_t remote_qkey;
++};
++
++static inline void setup_dest(struct dest *d, struct endpoint *ep, uint32_t remote_qpn, uint32_t remote_qkey)
++{
++	d->ep = ep;
++	d->remote_qpn = remote_qpn;
++	d->remote_qkey = remote_qkey;
++}
++
+ static struct i2r_interface {
+ 	/* Not changed when multithreading */
+ 	struct ibv_context *context;		/* Not for RDMA CM use */
+@@ -383,17 +401,6 @@ static struct i2r_interface {
+ } i2r[NR_INTERFACES];
+ 
+ /*
+- * Information provided by RDMA subsystem for how
+- * to send a stream to an endpoint that
+- * maybe multicast or unicast.
+- */
+-struct ah_info {
+-	struct ibv_ah *ah;	/* Endpoint Identification */
+-	uint32_t remote_qpn;	/* Address on the Endpoint */
+-	uint32_t remote_qkey;
+-};
+-
+-/*
+  * A Unicastconnection to a certain port and host with
+  * a list of pending I/O items and an rdma channel
+  */
+@@ -406,7 +413,7 @@ struct rdma_unicast {
+ 	struct sockaddr_in sin;		/* Target address */
+ 	struct rdma_channel *c;		/* Channel for resolution and I/O */
+ 	struct fifo pending;		/* Buffers waiting on resolution to complete */
+-	struct ah_info ai;		/* If ai.ah != NULL then the address info is valid */
++	struct dest dest;
+ };
+ 
+ static inline void st(struct rdma_channel *c, enum stats s)
+@@ -423,6 +430,7 @@ static void handle_receive_packet(void *
+ static void handle_comp_event(void *private);
+ static void handle_rdma_event(void *private);
+ static void handle_async_event(void *private);
++static struct endpoint *mc_to_ep(struct i2r_interface *i, struct in_addr addr, struct ibv_pd *pd, struct ibv_ah_attr *at);
+ 
+ 
+ static inline struct rdma_cm_id *id(enum interfaces i)
+@@ -619,7 +627,7 @@ const char *mc_text[NR_MC_STATUS] = { "I
+ struct mc_interface {
+ 	enum mc_status status;
+ 	bool sendonly;
+-	struct ah_info ai;
++	struct dest dest;
+ 	struct sockaddr *sa;
+ 	uint32_t packet_time;		/* How much time must elapse for a packet to be sent 0 = disabled */
+ 	uint32_t max_burst;		/* How long can a burst last */
+@@ -2332,13 +2340,11 @@ static void handle_rdma_event(void *priv
+ 			{
+ 				struct rdma_ud_param *param = &event->param.ud;
+ 				struct mc *m = (struct mc *)param->private_data;
+-				struct ah_info *a = &m->interface[in].ai;
++				struct dest *d = &m->interface[in].dest;
+ 				char buf[40];
+ 
+-				a->remote_qpn = param->qp_num;
+-				a->remote_qkey = param->qkey;
+-				a->ah = ibv_create_ah(i->multicast->pd, &param->ah_attr);
+-				if (!a->ah) {
++				setup_dest(d, mc_to_ep(i, m->addr, i->multicast->pd, &param->ah_attr), param->qp_num, param->qkey);
++				if (!d->ep->ah) {
+ 					logg(LOG_ERR, "Failed to create AH for Multicast group %s on %s \n",
+ 						m->text, i->text);
+ 					m->interface[in].status = MC_ERROR;
+@@ -2490,14 +2496,12 @@ static void handle_rdma_event(void *priv
+ 
+ 		case RDMA_CM_EVENT_ESTABLISHED:
+ 			{
+-				struct ah_info *ai = &ru->ai;
++				struct dest *d = &ru->dest;
+ 
+ 				logg(LOG_NOTICE, "RDMA_CM_EVENT_ESTABLISHED for %s:%d\n",
+ 					inet_ntoa(ru->sin.sin_addr), ntohs(ru->sin.sin_port));
+ 
+-				ai->ah = ibv_create_ah(ru->c->pd, &event->param.ud.ah_attr);
+-				ai->remote_qpn = event->param.ud.qp_num;
+-				ai->remote_qkey = event->param.ud.qkey;
++				setup_dest(d, mc_to_ep(i, ru->sin.sin_addr, ru->c->pd, &event->param.ud.ah_attr), event->param.ud.qp_num, event->param.ud.qkey);
+ 
+ 				rdma_ack_cm_event(event);
+ 				ru->state = UC_CONNECTED;
+@@ -2540,7 +2544,7 @@ err:
+  *
+  * Space in the WR is limited, so it only works for very small packets.
+  */
+-static int send_inline(struct rdma_channel *c, void *addr, unsigned len, struct ah_info *ai, bool imm_used, unsigned imm)
++static int send_inline(struct rdma_channel *c, void *addr, unsigned len, struct dest *d, bool imm_used, unsigned imm)
+ {
+ 	struct ibv_sge sge = {
+ 		.length = len,
+@@ -2555,9 +2559,9 @@ static int send_inline(struct rdma_chann
+ 		.wr = {
+ 			/* Get addr info  */
+ 			.ud = {
+-				.ah = ai->ah,
+-				.remote_qpn = ai->remote_qpn,
+-				.remote_qkey = ai->remote_qkey
++				.ah = d->ep->ah,
++				.remote_qpn = d->remote_qpn,
++				.remote_qkey = d->remote_qkey
+ 			}
+ 		}
+ 
+@@ -2636,7 +2640,7 @@ static int send_ud(struct rdma_channel *
+  * to be able to free up resources when done.
+  */
+ static int send_to(struct rdma_channel *c,
+-	void *addr, unsigned len, struct ah_info *ai,
++	void *addr, unsigned len, struct dest *d,
+ 	bool imm_used, unsigned imm,
+ 	struct buf *buf)
+ {
+@@ -2644,7 +2648,7 @@ static int send_to(struct rdma_channel *
+ 	struct ibv_sge sge;
+ 	int ret;
+ 
+-	if (!ai->ah)
++	if (!d->ep->ah)
+ 		abort();	/* Send without a route */
+ 
+ 	buf->c = c;	/* Change ownership to sending channel */
+@@ -2659,9 +2663,9 @@ static int send_to(struct rdma_channel *
+ 	wr.imm_data = imm;
+ 
+ 	/* Get addr info  */
+-	wr.wr.ud.ah = ai->ah;
+-	wr.wr.ud.remote_qpn = ai->remote_qpn;
+-	wr.wr.ud.remote_qkey = ai->remote_qkey;
++	wr.wr.ud.ah = d->ep->ah;
++	wr.wr.ud.remote_qpn = d->remote_qpn;
++	wr.wr.ud.remote_qkey = d->remote_qkey;
+ 
+ 	sge.length = len;
+ 	sge.lkey = c->mr->lkey;
+@@ -2690,9 +2694,9 @@ static int send_buf(struct buf *buf, str
+ 	int ret;
+ 
+ 	if (len < MAX_INLINE_DATA) {
+-		ret = send_inline(ra->c, buf->cur, len, &ra->ai, buf->imm_valid, buf->imm);
++		ret = send_inline(ra->c, buf->cur, len, &ra->dest, buf->imm_valid, buf->imm);
+ 	} else
+-		ret = send_to(ra->c, buf->cur, len, &ra->ai, buf->imm_valid, buf->imm, buf);
++		ret = send_to(ra->c, buf->cur, len, &ra->dest, buf->imm_valid, buf->imm, buf);
+ 
+ 	return ret;
+ }
+@@ -3539,7 +3543,28 @@ redo:
+ 	return ep;
+ }
+ 
++static struct endpoint *mc_to_ep(struct i2r_interface *i, struct in_addr addr, struct ibv_pd *pd, struct ibv_ah_attr *at)
++{
++	struct ibv_ah *ah;
++	struct endpoint *ep;
++
++	if (rate)
++		at->static_rate = rate;
+ 
++	ah = ibv_create_ah(pd, at);
++	if (!ah) {
++		logg(LOG_ERR, "mc_to_ep: Failed to create Endpoint on %s: %s. IP=%s\n",
++				i->text, errname(), inet_ntoa(addr));
++		return NULL;
++	}
++
++	ep = calloc(1, sizeof(struct endpoint));
++	ep->i = i;
++	ep->addr = addr;
++	ep->lid = at->dlid;
++	ep->ah = ah;
++	return ep;
++}
+ 
+ /* Create Endpoint just from the IP address */
+ static struct endpoint *ip_to_ep(struct i2r_interface *i, struct in_addr addr)
+@@ -3664,7 +3689,7 @@ static void delayed_send(void *private)
+ 		mi->last_sent = timestamp();
+ 	}
+ 
+-	ret = send_to(c, buf->cur, buf->end - buf->cur, &mi->ai, buf->imm_valid, buf->imm, buf);
++	ret = send_to(c, buf->cur, buf->end - buf->cur, &mi->dest, buf->imm_valid, buf->imm, buf);
+ 	if (!ret)
+ 		st(c, packets_bridged);
+ 	buf->mi = NULL;
+@@ -3831,7 +3856,7 @@ delayed_packet:
+ 		mi->last_sent = t;
+ 	}
+ 
+-	ret = send_to(ch_out, buf->cur, buf->end - buf->cur, &mi->ai, buf->imm_valid, buf->imm, buf);
++	ret = send_to(ch_out, buf->cur, buf->end - buf->cur, &mi->dest, buf->imm_valid, buf->imm, buf);
+ 
+ 	if (ret)
+ 		return;
+@@ -5106,9 +5131,9 @@ static void beacon_send(void *private)
+ 				if (sizeof(b) > MAX_INLINE_DATA) {
+ 					buf = alloc_buffer(i->multicast);
+ 					memcpy(buf->raw, &b, sizeof(b));
+-					send_to(i->multicast, buf, sizeof(b), &beacon_mc->interface[in].ai, false, 0, buf);
++					send_to(i->multicast, buf, sizeof(b), &beacon_mc->interface[in].dest, false, 0, buf);
+ 				} else
+-					send_inline(i->multicast, &b, sizeof(b), &beacon_mc->interface[in].ai, false, 0);
++					send_inline(i->multicast, &b, sizeof(b), &beacon_mc->interface[in].dest, false, 0);
+ 			}
+ 		}
+ 

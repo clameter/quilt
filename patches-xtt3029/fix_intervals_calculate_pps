@@ -1,0 +1,58 @@
+Index: rdma-core/ib2roce/channel.c
+===================================================================
+--- rdma-core.orig/ib2roce/channel.c
++++ rdma-core/ib2roce/channel.c
+@@ -661,6 +661,7 @@ void arm_channels(struct core_info *core
+ }
+ 
+ static int stat_interval = 10;		/* Interval for statistics */
++static uint64_t stat_start;		/* Starting the next calculation */
+ 
+ static void calculate_pps_channel(FILE *out, struct rdma_channel *c)
+ {
+@@ -682,10 +683,17 @@ static void calculate_pps_channel(FILE *
+ 	c->last_snapshot = now;
+ }
+ 
+-void calculate_pps(void *private)
++static void calculate_pps(void *private)
+ {
+ 	all_channels(NULL, calculate_pps_channel);
+-	add_event(now + seconds(stat_interval), calculate_pps, NULL, "pps calculation");
++	stat_start += seconds(stat_interval);
++	add_event(stat_start, calculate_pps, NULL, "pps calculation");
++}
++
++void start_calculate_pps(void)
++{
++	stat_start = now;
++	calculate_pps(NULL);
+ }
+ 
+ static void channel_zap(FILE *out, struct rdma_channel *c)
+Index: rdma-core/ib2roce/channel.h
+===================================================================
+--- rdma-core.orig/ib2roce/channel.h
++++ rdma-core/ib2roce/channel.h
+@@ -162,7 +162,7 @@ void channel_destroy(struct rdma_channel
+ 
+ void all_channels(FILE *out, void (*func)(FILE *out, struct rdma_channel *));
+ 
+-void calculate_pps(void *private);
++void start_calculate_pps(void);
+ 
+ void show_core_config(void);
+ 
+Index: rdma-core/ib2roce/ib2roce.c
+===================================================================
+--- rdma-core.orig/ib2roce/ib2roce.c
++++ rdma-core/ib2roce/ib2roce.c
+@@ -350,7 +350,7 @@ static void setup_timed_events(void)
+ 	if (background)
+ 		logging(NULL);
+ 
+-	calculate_pps(NULL);
++	start_calculate_pps();
+ 
+ 	check_joins(&i2r[INFINIBAND].channels, &i2r[ROCE].channels);
+ 

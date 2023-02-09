@@ -17,7 +17,7 @@ Index: rdma-core/ib2roce/buffers.c
  	return buf;
 +
 +oom:
-+	panic("Out of Buffers\n");
++	panic("Out of Buffers allocating for channel %s\n", c ? c->text : "Unknown");
 +	return NULL;
  }
  

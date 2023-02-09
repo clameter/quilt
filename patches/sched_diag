@@ -2,7 +2,7 @@ Index: rdma-core/ib2roce/sched.c
 ===================================================================
 --- rdma-core.orig/ib2roce/sched.c
 +++ rdma-core/ib2roce/sched.c
-@@ -198,17 +198,24 @@ void add_event(uint64_t time, event_call
+@@ -214,17 +214,24 @@ void add_event(uint64_t time, event_call
   */
  uint64_t run_events(void)
  {

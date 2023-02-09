@@ -19,13 +19,14 @@ Index: rdma-core/ib2roce/buffers.c
  		goto queue;
  
  	c->active_send_buffers++;
-@@ -386,6 +387,20 @@ int send_to(struct rdma_channel *c,
+@@ -386,6 +387,21 @@ int send_to(struct rdma_channel *c,
  queue:
  	fifo_put(&c->send_queue, buf);
  	st(c, packets_queued);
 +
 +	if (backlog > c->max_backlog) {
-+		logg(LOG_WARNING, "Backlog for %s has more than %d buffers. Dropping backlog.\n",
++		if (!c->backlog_drop)
++			logg(LOG_WARNING, "Backlog for %s has more than %d buffers. Starting to drop from the backlog.\n",
 +			       c->text, c->max_backlog);
 +		do {
 +
@@ -52,6 +53,17 @@ Index: rdma-core/ib2roce/channel.c
  	fifo_init(&c->send_queue);
  
  	if (ci->setup(c)) {
+@@ -772,8 +773,8 @@ void channel_stat(int indent, FILE *out,
+ 	memset(indent_str, ' ', indent);
+ 	indent_str[indent] = 0;
+ 
+-	fprintf(out, "%sChannel %s: ActiveRecvBuffers=%u/%u ActiveSendBuffers=%u/%u CQ_high=%u SendQ=%u\n", indent_str, c->text,
+-		c->active_receive_buffers, c->nr_receive, c->active_send_buffers, c->nr_send, c->cq_high, fifo_items(&c->send_queue));
++	fprintf(out, "%sChannel %s: ActiveRecvBuffers=%u/%u ActiveSendBuffers=%u/%u CQ_high=%u SendQ=%u BacklogDrops=%u\n", indent_str, c->text,
++		c->active_receive_buffers, c->nr_receive, c->active_send_buffers, c->nr_send, c->cq_high, fifo_items(&c->send_queue), c->backlog_drop);
+ 
+ 	if (c->last_snapshot && (c->max_pps_in || c->max_pps_out))
+ 		fprintf(out, "%s pps_in=%d pps_out=%d max_pps_in=%d max_pps_out=%d\n",
 Index: rdma-core/ib2roce/channel.h
 ===================================================================
 --- rdma-core.orig/ib2roce/channel.h

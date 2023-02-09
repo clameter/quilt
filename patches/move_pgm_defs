@@ -1,0 +1,62 @@
+Index: rdma-core/ib2roce/buffers.h
+===================================================================
+--- rdma-core.orig/ib2roce/buffers.h
++++ rdma-core/ib2roce/buffers.h
+@@ -113,6 +113,25 @@ static inline void pull(struct buf *buf,
+ 
+ #define PULL(__BUF, __VAR) pull(__BUF, &(__VAR), sizeof(__VAR))
+ 
++static inline void push(struct buf *buf, void *src, unsigned length)
++{
++	memcpy(buf->end, src, length);
++	buf->end += length;
++}
++
++static inline void *vpush(struct buf *buf, void *src, unsigned length)
++{
++	void *p = buf->end;
++
++	buf->end += length;
++	return p;
++}
++
++#define PUSH(__BUF, __VAR) push(__BUF, &(__VAR), sizeof(__VAR))
++
++#define VPUSH(__BUF, __VAR) { __VAR = (void  *)buf->end; buf->end += sizeof(*__VAR);}
++
++
+ extern struct buf *buffers;
+ 
+ extern struct buf *nextbuffer;	/* Pointer to next available RDMA buffer */
+Index: rdma-core/ib2roce/pgm.c
+===================================================================
+--- rdma-core.orig/ib2roce/pgm.c
++++ rdma-core/ib2roce/pgm.c
+@@ -37,7 +37,6 @@
+ 
+ #include "interfaces.h"
+ #include "pgm.h"
+-#include "packet.h"
+ #ifdef UNICAST
+ #include "endpoint.h"
+ #endif
+Index: rdma-core/ib2roce/pgm.h
+===================================================================
+--- rdma-core.orig/ib2roce/pgm.h
++++ rdma-core/ib2roce/pgm.h
+@@ -40,11 +40,15 @@
+ #include "channel.h"
+ #include "multicast.h"
+ #include "buffers.h"
++#include "packet.h"
+ 
+ enum pgm_mode { pgm_off, pgm_strict, pgm_llm, pgm_passthrough, pgm_dlr, pgm_resend };
+ 
+ extern enum pgm_mode pgm_mode;
+ 
++
++
++
+ bool pgm_process(struct rdma_channel *c, struct mc *m, struct buf *buf);
+ 
+ unsigned pgm_brief_stats(char *b, struct i2r_interface *i);

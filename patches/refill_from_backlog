@@ -2,7 +2,7 @@ Index: rdma-core/ib2roce/interfaces.c
 ===================================================================
 --- rdma-core.orig/ib2roce/interfaces.c
 +++ rdma-core/ib2roce/interfaces.c
-@@ -1083,6 +1083,10 @@ static void process_cqes(struct rdma_cha
+@@ -1088,6 +1088,10 @@ static void process_cqes(struct rdma_cha
  
  	/* Since we freed some buffers up we may be able to post more of them */
  	post_receive(c);
@@ -12,8 +12,8 @@ Index: rdma-core/ib2roce/interfaces.c
 +		send_pending_buffers(c);
  }
  
- 
-@@ -1118,8 +1122,6 @@ void scan_cqs(void *private)
+ /*
+@@ -1120,8 +1124,6 @@ void scan_cqs(void *private)
  				continue;
  			}
  		}

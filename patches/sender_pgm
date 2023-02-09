@@ -2,7 +2,21 @@ Index: rdma-core/ib2roce/sender.c
 ===================================================================
 --- rdma-core.orig/ib2roce/sender.c
 +++ rdma-core/ib2roce/sender.c
-@@ -51,36 +51,121 @@ static unsigned sender_seq = 1;
+@@ -40,6 +40,7 @@
+ #include "interfaces.h"
+ #include "sender.h"
+ #include "cli.h"
++#include "packet.h"
+ 
+ static unsigned sendrate = 5;
+ static unsigned sendbatch = 1;
+@@ -47,42 +48,118 @@ static unsigned sendlen = 1024;
+ 
+ static uint64_t sender_interval;
+ static uint64_t sender_time;
+-static unsigned sender_seq;
++static unsigned sender_seq = 1;
+ 
  static unsigned sessionid;
  static char hostname[40];
  
@@ -20,63 +34,11 @@ Index: rdma-core/ib2roce/sender.c
  
  #define SENDER_SIGNATURE 0xD3ADB33F
  
-+enum pgm_type { 
-+	pgm_spm, pgm_poll, pgm_polr,
-+	pgm_odata = 0x4, pgm_rdata,
-+	pgm_nak = 0x8, pgm_nnak, pgm_ncf,
-+	pgm_spmr = 0xc, pgm_ack,
-+	pgm_max = 0xff
-+};
-+
-+enum pgm_options {
-+	opt_length, opt_fragment, opt_nak_list, opt_join, opt_nak_bo_ivl, opt_nak_bo_rng,
-+	opt_redirect = 0x7, opt_parity_prm, opt_parity_grp, opt_curr_tgsize, 
-+	opt_nbr_unreach = 0xb, opt_path_nla,
-+	opt_syn = 0xd, opt_fin, opt_rst,
-+	opt_cr = 0x10, opt_crqst, opt_pgmcc_data, opt_pgmcc_feedback,
-+	opt_invalid = 0x7f,
-+	opt_parity = 0x80, opt_end = 0x80,
-+	opt_var_pktlen = 0x40,
-+	opt_network = 0x02,
-+	opt_presnet = 0x01,
-+};
-+
-+
-+struct pgm_header {
-+	uint16_t sport;
-+	uint16_t dport;
-+	uint8_t type;
-+	uint8_t options;
-+	uint16_t checksum;
-+	struct in_addr source;
-+	uint16_t gsilow;
-+	uint16_t tsdu_length;
-+};
-+
-+struct pgm_data {
-+	uint32_t spn;
-+	uint32_t trail;
-+};
-+
-+struct pgm_opt {
-+	uint8_t type;
-+	uint8_t length;
-+	union {
-+		uint8_t reserved;
-+		uint16_t total_length;
-+	};
-+};
-+
-+struct testframe {
-+	struct pgm_header h;
-+	struct pgm_data d;
-+	struct pgm_opt o[10];
-+	struct sender_info s;
-+};
-+
+-static void prep_sender_struct(struct i2r_interface *i, struct buf *buf)
 +/*
 +static void send_data(struct mc *, struct buf *buf, int resend)
-+{
+ {
+-	struct sender_info *b = (void *)buf->raw;
 +}
 +
 +static void receive_data(struct mc *, struct buf *buf)
@@ -92,10 +54,16 @@ Index: rdma-core/ib2roce/sender.c
 +}
 +
 +*/
- static void prep_sender_struct(struct i2r_interface *i, struct buf *buf)
- {
--	struct sender_info *b = (void *)buf->raw;
-+	struct testframe *t = (void *)buf->raw;
++static void prep_sender_struct(struct i2r_interface *i, struct buf *buf, struct mc *m)
++{
++	struct pgm_header *h;
++	struct pgm_data *d;
++	struct pgm_opt_length *ol;
++	struct sender_info *s;
++	bool last_opt;
++
++	buf->end = buf->raw;
++
  
  	/* Max MTU is 4096 bytes */
  	if (sendlen > 4096)
@@ -107,30 +75,189 @@ Index: rdma-core/ib2roce/sender.c
 -	b->signature = SENDER_SIGNATURE;
 -	memcpy(b->name, hostname, sizeof(hostname));
 -	b->sessionid = sessionid;
-+	/* This is pretty raw */
-+	t->h.sport = 9999;
-+	t->h.dport = 9999;
-+	t->h.type = pgm_odata;
-+	t->h.options = 0;
-+	t->h.checksum = 0;
-+	t->h.source = i->if_addr.sin_addr;
-+	t->h.gsilow = 9999;
-+	t->h.tsdu_length = 4000;
-+
-+	t->d.spn = sender_seq;
-+	t->d.trail = sender_seq;
-+
-+	t->o[0].type = opt_length | opt_end;
-+	t->o[0].length = sizeof(struct pgm_data) + sizeof(struct pgm_opt);
-+
-+
-+	t->s.signature = SENDER_SIGNATURE;
-+	memcpy(t->s.name, hostname, sizeof(hostname));
-+	t->s.sessionid = sessionid;
- 
+-
 -	b->timestamp = now;
 -	b->sqn = sender_seq;
-+	t->s.timestamp = now;
- 	buf->end = buf->raw + sendlen;
+-	buf->end = buf->raw + sendlen;
++	VPUSH(buf, h);
++
++	h->pgm_sport = htons(i->port);
++	h->pgm_dport = htons(m->port);
++	h->pgm_type = PGM_ODATA;
++	h->pgm_options = PGM_OPT_PRESENT;
++	h->pgm_checksum = 0;
++	memcpy(h->pgm_gsi, &i->if_addr.sin_addr, sizeof(i->if_addr.sin_addr));
++	memcpy(h->pgm_gsi + 4, &i->if_addr.sin_port, sizeof(i->if_addr.sin_port));
++
++	VPUSH(buf, d);
++	d->data_sqn = htonl(sender_seq);
++	d->data_trail = htonl(sender_seq);
++
++	VPUSH(buf, ol);
++
++	last_opt = sender_seq > 1;
++
++	/* Options follow opt_length is needed */
++	ol->opt_type = PGM_OPT_LENGTH;
++        if (last_opt)
++		ol->opt_type |= PGM_OPT_END;
++
++	ol->opt_length = sizeof(struct pgm_opt_length);
++
++	if (sender_seq == 1) {
++		struct pgm_opt_header *poh;
++		struct pgm_opt_syn *pos;
++
++		VPUSH(buf, poh);
++		poh->opt_type = PGM_OPT_SYN | PGM_OPT_END;
++		poh->opt_reserved = 0;
++
++		VPUSH(buf, pos);
++		pos->opt_reserved = 0;
++
++		poh->opt_length = buf->end - (uint8_t *)poh;
++
++	}
++
++/*
++	Missing
++       	OPT_FIN in last packet
++ 	OPT_RST for unrecoverable error
++*/
++
++	ol->opt_total_length = htons(buf->end - (uint8_t *)ol);
++
++	VPUSH(buf, s);
++	s->signature = SENDER_SIGNATURE;
++	memcpy(s->name, hostname, sizeof(hostname));
++	s->sessionid = sessionid;
++
++	s->timestamp = now;
++
++	/* RFC3208 8. Packet formats */
++	h->pgm_tsdu_length = htons(buf->end - buf->raw - sizeof(struct pgm_header));
++
++	/* Stuff it if sendlen is defined */
++	if (buf->end < buf->raw + sendlen)
++		buf->end = buf->raw +sendlen;
  }
  
+ static void sender_send(void *private)
+@@ -105,14 +182,14 @@ static void sender_send(void *private)
+ 				continue;
+ 
+ 			buf = alloc_buffer(c);
+-			prep_sender_struct(i, buf);
++			prep_sender_struct(i, buf, m);
+ 			send_to(c, buf->raw, buf->end - buf->raw, &m->interface[default_interface].ai, false, 0, buf);
+ 		}
+ 		sender_seq++;
+ 	}
+ 
+ 	sender_time += sender_interval;
+-	add_event(sender_time, sender_send, NULL, "*Sender Send");
++	add_event(sender_time, sender_send, NULL, "Sender Send");
+ }
+ 
+ void sender_shutdown(void)
+Index: rdma-core/ib2roce/pgm.c
+===================================================================
+--- rdma-core.orig/ib2roce/pgm.c
++++ rdma-core/ib2roce/pgm.c
+@@ -37,7 +37,6 @@
+ 
+ #include "interfaces.h"
+ #include "pgm.h"
+-#include "packet.h"
+ #ifdef UNICAST
+ #include "endpoint.h"
+ #endif
+@@ -110,7 +109,7 @@ static void format_tsi(char *b, struct p
+ 
+ 	strcpy(c, inet_ntoa(tsi->sender));
+ 
+-	snprintf(b, 60, "%s:%d->%s:%d", c, ntohs(tsi->sport), inet_ntoa(tsi->mcgroup), ntohs(tsi->dport));
++	snprintf(b, 60, "%s:%d->%s:%d", c, tsi->sport, inet_ntoa(tsi->mcgroup), tsi->dport);
+ }
+ 
+ static bool add_record(struct buf *buf, struct pgm_tsi *tsi, uint32_t sqn, void *start, unsigned len)
+@@ -265,7 +264,7 @@ bool pgm_process(struct rdma_channel *c,
+ 			if (sqn < s->last_seq) {
+ 				s->dup++;
+ 				ret = false;
+-				logg(LOG_NOTICE, "%s: Repeated data out of Window\n", s->text);
++				logg(LOG_NOTICE, "%s: Repeated data out of Window SQN=%u < last=%u\n", s->text, sqn, s->last_seq);
+ 				break;
+ 			}
+ 
+@@ -436,6 +435,9 @@ bool pgm_process(struct rdma_channel *c,
+ 				case PGM_OPT_SYN:
+ 					PULL(buf, syn);
+ 					logg(LOG_INFO, "%s: OPT SYN\n", text);
++					s->last_seq = sqn;
++					s->last = sqn;
++					s->oldest = sqn;
+ 					break;
+ 				case PGM_OPT_FIN:
+ 					PULL(buf, fin);
+@@ -516,31 +518,32 @@ static void tsi_cmd(FILE *out, char *par
+ 
+ 				format_tsi(buf, &ps->tsi);
+ 
+-				fprintf(out, "%s: lead=%d trail=%d last=%d lastRepairData=%d oldest=%d\n",
++				fprintf(out, "%s: lead=%d trail=%d last=%d lastRepairData=%d oldest=%d",
+ 					buf, ps->lead, ps->trail, ps->last, ps->rlast, ps->oldest);
+ 
+ 				if (ps->dup)
+-					fprintf(out, "Dup(OData!)=%u", ps->dup);
++					fprintf(out, " dup(OData!)=%u", ps->dup);
+ 
+ 				if (ps->rdup)
+-					fprintf(out, "Dup(Rdata!)=%u", ps->rdup);
++					fprintf(out, " dup(Rdata!)=%u", ps->rdup);
+ 
+ 				if (ps->rdata)
+-					fprintf(out, "rdata=%u", ps->rdata);
++					fprintf(out, " rdata=%u", ps->rdata);
+ 
+ 				if (ps->ack)
+-					fprintf(out, "ack=%u", ps->ack);
++					fprintf(out, " ack=%u", ps->ack);
+ 
+ 				if (ps->nak)
+-					fprintf(out, "nak=%u", ps->nak);
++					fprintf(out, " nak=%u", ps->nak);
+ 
+ 				if (ps->first_sqn)
+-					fprintf(out, "firstsqn=%u", ps->first_sqn);
++					fprintf(out, " firstsqn=%u", ps->first_sqn);
+ 
+ 				if (ps->sqn_seq_errs) {
+-					fprintf(out, "sqnerrs=%u lastmissed=%u nr_missed=%u",
++					fprintf(out, " sqnerrs=%u lastmissed=%u nr_missed=%u",
+ 						ps->sqn_seq_errs, ps->last_missed_sqn, ps->last_missed_sqns);
+ 				}
++				fprintf(out, "\n");
+   			}
+ 			offset += nr;
+ 		}
+Index: rdma-core/ib2roce/pgm.h
+===================================================================
+--- rdma-core.orig/ib2roce/pgm.h
++++ rdma-core/ib2roce/pgm.h
+@@ -40,11 +40,15 @@
+ #include "channel.h"
+ #include "multicast.h"
+ #include "buffers.h"
++#include "packet.h"
+ 
+ enum pgm_mode { pgm_off, pgm_strict, pgm_llm, pgm_passthrough, pgm_dlr, pgm_resend };
+ 
+ extern enum pgm_mode pgm_mode;
+ 
++
++
++
+ bool pgm_process(struct rdma_channel *c, struct mc *m, struct buf *buf);
+ 
+ unsigned pgm_brief_stats(char *b, struct i2r_interface *i);

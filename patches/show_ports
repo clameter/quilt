@@ -2,7 +2,7 @@ Index: rdma-core/ib2roce/channel.c
 ===================================================================
 --- rdma-core.orig/ib2roce/channel.c
 +++ rdma-core/ib2roce/channel.c
-@@ -773,8 +773,11 @@ void channel_stat(int indent, FILE *out,
+@@ -794,8 +794,11 @@ void channel_stat(int indent, FILE *out,
  	memset(indent_str, ' ', indent);
  	indent_str[indent] = 0;
  

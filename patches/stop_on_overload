@@ -12,3 +12,15 @@ Index: rdma-core/ib2roce/sched.c
  		/* Run long overdue scheduled events */
  		while (timeout != NO_EVENTS && timeout < -(long)milliseconds(10))
  			timeout = run_events();
+Index: rdma-core/ib2roce/ib2roce.c
+===================================================================
+--- rdma-core.orig/ib2roce/ib2roce.c
++++ rdma-core/ib2roce/ib2roce.c
+@@ -507,6 +507,7 @@ int main(int argc, char **argv)
+ {
+ 	int ret = 0;
+ 
++	now = timestamp();
+ 	parse_options(argc, argv);
+ 
+ 	if (debug || !bridging) {

@@ -5,6 +5,8 @@ sched_diag
 show_ports
 add_push
 sender_pgm
+parse_options_etc
+vpull
 move_text_var
 move_find
 jkjk

@@ -1,0 +1,90 @@
+Index: rdma-core/ib2roce/pgm.c
+===================================================================
+--- rdma-core.orig/ib2roce/pgm.c
++++ rdma-core/ib2roce/pgm.c
+@@ -93,6 +93,63 @@ struct pgm_record {
+ 	unsigned len;			/* Length of the message */
+ };
+ 
++#define MAX_PGM_TYPE (PGM_ACK + 1)
++#define PGM_TYPE_MASK (PGM_OPT_VAR_PKTLEN -1)
++#define MAX_PGM_OPT PGM_OPT_PGMCC_FEEDBACK
++
++/* This is only valid for IPv4 */
++uint16_t pgm_type_sizes[MAX_PGM_TYPE] = {
++        sizeof(struct pgm_spm), 	/* PGM_SPM         = 0x00 */
++        sizeof(struct pgm_poll),	/* PGM_POLL        = 0x01 */
++        sizeof(struct pgm_polr),	/* PGM_POLR        = 0x02 */
++	0,
++        sizeof(struct pgm_data),	/* PGM_ODATA       = 0x04 */
++        sizeof(struct pgm_data),	/* PGM_RDATA       = 0x05 */
++	0,
++	0,
++        sizeof(struct pgm_nak),	/* PGM_NAK         = 0x08 */
++        sizeof(struct pgm_nak),	/* PGM_NNAK        = 0x09 */
++        sizeof(struct pgm_nak),	/* PGM_NCF         = 0x0a */
++	0,
++        0,			/* PGM_SPMR        = 0x0c ??? Not defined */
++	/* the next one is a bit strange since not covered by the RFC. We simply use the nak structure */
++        sizeof(struct pgm_nak)	/* PGM_ACK         = 0x0d */
++};
++
++static uint8_t *pgm_opt_parse(struct pgm_header *h, void **opt)
++{
++	uint8_t *a = (uint8_t *)h;
++	struct pgm_opt_header *poh;
++	unsigned n;
++
++	memset(opt, 0, sizeof(void *) * MAX_PGM_OPT);
++
++	n = h->pgm_type & PGM_TYPE_MASK;
++
++	if (n >= MAX_PGM_TYPE || !pgm_type_sizes[n])
++		/* Unsupported PGM type */
++		return NULL;
++
++	/* move to the beginning of the options */
++	a += pgm_type_sizes[n];
++
++	if (!(h->pgm_type & PGM_OPT_PRESENT))
++		/* No options available */
++		return a;
++
++	do {
++		poh = (struct pgm_opt_header *)a;
++		n = poh->opt_type & PGM_OPT_MASK;
++
++		if (n < MAX_PGM_OPT)
++			opt[n] = a + sizeof(struct pgm_opt_header);
++
++		a += poh->opt_length;
++	} while (!(poh->opt_type & PGM_OPT_END));
++
++	return a;
++}
++
+ static void init_pgm_streams(void)
+ {
+ 	struct i2r_interface *i;
+Index: rdma-core/ib2roce/buffers.h
+===================================================================
+--- rdma-core.orig/ib2roce/buffers.h
++++ rdma-core/ib2roce/buffers.h
+@@ -111,7 +111,17 @@ static inline void pull(struct buf *buf,
+ 	buf->cur += length;
+ }
+ 
++static inline void *vpull(struct buf *buf, unsigned length)
++{
++	void *p = buf->cur;
++
++	buf->cur += length;
++
++	return p;
++}
++
+ #define PULL(__BUF, __VAR) pull(__BUF, &(__VAR), sizeof(__VAR))
++#define VPULL(__BUF, __VAR) (__VAR) = vpull(__BUF, sizeof(__VAR))
+ 
+ static inline void push(struct buf *buf, void *src, unsigned length)
+ {

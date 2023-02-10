@@ -1,0 +1,90 @@
+Index: rdma-core/ib2roce/pgm.c
+===================================================================
+--- rdma-core.orig/ib2roce/pgm.c
++++ rdma-core/ib2roce/pgm.c
+@@ -93,7 +93,6 @@ struct pgm_record {
+ 	struct pgm_stream *stream;
+ 	struct buf *buf;		/* Address of buffer */
+ 	void *start;			/* Beginning of ODATA/RDATA record */
+-	unsigned len;			/* Length of the message */
+ };
+ 
+ static void init_pgm_streams(void)
+@@ -115,7 +114,7 @@ static void format_tsi(char *b, struct p
+ 	snprintf(b, 60, "%s:%d->%s:%d", c, tsi->sport, inet_ntoa(tsi->mcgroup), tsi->dport);
+ }
+ 
+-static bool add_record(struct buf *buf, struct pgm_tsi *tsi, uint32_t sqn, void *start, unsigned len)
++static bool add_record(struct buf *buf, struct pgm_tsi *tsi, uint32_t sqn, void *start)
+ {
+ 	struct i2r_interface *i = buf->c->i;
+ 	struct pgm_record *r = calloc(1, sizeof(struct pgm_record));
+@@ -125,7 +124,6 @@ static bool add_record(struct buf *buf,
+ 	r->sqn = sqn;
+ 	r->buf = buf;
+ 	r->start = start;
+-	r->len = len;
+ 
+ 	lock();
+ 	if ((q = hash_find(i->pgm_record_hash, &r))) {
+@@ -139,7 +137,7 @@ static bool add_record(struct buf *buf,
+ 	}
+ }
+ 
+-static struct pgm_record *find_record(struct i2r_interface *i, struct pgm_tsi *tsi, uint32_t sqn)
++static struct pgm_stream *find_record(struct i2r_interface *i, struct pgm_tsi *tsi, uint32_t sqn)
+ {
+ 	struct pgm_record f = { .tsi = *tsi, .sqn = sqn };
+ 
+@@ -156,13 +154,24 @@ static void deliver_in_seq(struct buf *b
+ {
+ }
+ 
++static struct pgm_stream *tsi_find(struct i2r_interface *i, struct mc *m, struct pgm_header *h)
++{
++	struct pgm_tsi tsi;
++
++	tsi.mcgroup = m->addr;
++	memcpy(&tsi.sender, h->pgm_gsi, sizeof(struct in_addr));
++	tsi.sport = ntohs(h->pgm_sport);
++	tsi.dport = ntohs(h->pgm_dport);
++
++	return	hash_find(i->pgm_tsi_hash, &tsi);
++}
++
++
+ bool pgm_process(struct rdma_channel *c, struct mc *m, struct buf *buf)
+ {
+ 	struct i2r_interface *i = c->i;
+-	struct pgm_tsi tsi;
+ 	struct pgm_stream *s;
+ 	uint32_t sqn;
+-	uint32_t tdsu;
+ 	uint16_t total_opt_length = 0;
+ 	uint8_t *options_start;
+ 	union {
+@@ -194,14 +203,7 @@ bool pgm_process(struct rdma_channel *c,
+ 	if (pgm_mode < pgm_passthrough)
+ 		return true;
+ 
+-	tdsu = ntohs(header.pgm.pgm_tsdu_length);
+-
+-	tsi.mcgroup = m->addr;
+-	memcpy(&tsi.sender, header.pgm.pgm_gsi, sizeof(struct in_addr));
+-	tsi.sport = ntohs(header.pgm.pgm_sport);
+-	tsi.dport = ntohs(header.pgm.pgm_dport);
+-
+-	s = hash_find(i->pgm_tsi_hash, &tsi);
++	s = tsi_find(i, m, &header.pgm);
+ 
+ 	switch (header.pgm.pgm_type) {
+ 		case PGM_SPM:		/* Multicast downstream */
+@@ -307,7 +309,7 @@ bool pgm_process(struct rdma_channel *c,
+ 
+ 			/* This is either the next data or missing data */
+ 
+-			if (!add_record(buf, &tsi, sqn, buf->cur, tdsu))
++			if (!add_record(buf, &tsi, sqn, buf->cur))
+ 				panic("PGM: SQN exists\n");
+ 
+ 			if (sqn == s->last_seq + 1) {

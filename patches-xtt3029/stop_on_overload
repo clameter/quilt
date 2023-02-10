@@ -2,7 +2,7 @@ Index: rdma-core/ib2roce/sched.c
 ===================================================================
 --- rdma-core.orig/ib2roce/sched.c
 +++ rdma-core/ib2roce/sched.c
-@@ -229,6 +229,9 @@ int event_loop(void)
+@@ -245,6 +245,9 @@ int event_loop(void)
  
  		timeout = time_to_next_event();
  

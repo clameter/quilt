@@ -2,15 +2,7 @@ Index: rdma-core/ib2roce/sender.c
 ===================================================================
 --- rdma-core.orig/ib2roce/sender.c
 +++ rdma-core/ib2roce/sender.c
-@@ -40,6 +40,7 @@
- #include "interfaces.h"
- #include "sender.h"
- #include "cli.h"
-+#include "packet.h"
- 
- static unsigned sendrate = 5;
- static unsigned sendbatch = 1;
-@@ -47,42 +48,118 @@ static unsigned sendlen = 1024;
+@@ -48,42 +48,118 @@ static unsigned sendlen = 1024;
  
  static uint64_t sender_interval;
  static uint64_t sender_time;
@@ -143,7 +135,7 @@ Index: rdma-core/ib2roce/sender.c
  }
  
  static void sender_send(void *private)
-@@ -105,14 +182,14 @@ static void sender_send(void *private)
+@@ -106,14 +182,14 @@ static void sender_send(void *private)
  				continue;
  
  			buf = alloc_buffer(c);
@@ -160,104 +152,3 @@ Index: rdma-core/ib2roce/sender.c
  }
  
  void sender_shutdown(void)
-Index: rdma-core/ib2roce/pgm.c
-===================================================================
---- rdma-core.orig/ib2roce/pgm.c
-+++ rdma-core/ib2roce/pgm.c
-@@ -37,7 +37,6 @@
- 
- #include "interfaces.h"
- #include "pgm.h"
--#include "packet.h"
- #ifdef UNICAST
- #include "endpoint.h"
- #endif
-@@ -110,7 +109,7 @@ static void format_tsi(char *b, struct p
- 
- 	strcpy(c, inet_ntoa(tsi->sender));
- 
--	snprintf(b, 60, "%s:%d->%s:%d", c, ntohs(tsi->sport), inet_ntoa(tsi->mcgroup), ntohs(tsi->dport));
-+	snprintf(b, 60, "%s:%d->%s:%d", c, tsi->sport, inet_ntoa(tsi->mcgroup), tsi->dport);
- }
- 
- static bool add_record(struct buf *buf, struct pgm_tsi *tsi, uint32_t sqn, void *start, unsigned len)
-@@ -265,7 +264,7 @@ bool pgm_process(struct rdma_channel *c,
- 			if (sqn < s->last_seq) {
- 				s->dup++;
- 				ret = false;
--				logg(LOG_NOTICE, "%s: Repeated data out of Window\n", s->text);
-+				logg(LOG_NOTICE, "%s: Repeated data out of Window SQN=%u < last=%u\n", s->text, sqn, s->last_seq);
- 				break;
- 			}
- 
-@@ -436,6 +435,9 @@ bool pgm_process(struct rdma_channel *c,
- 				case PGM_OPT_SYN:
- 					PULL(buf, syn);
- 					logg(LOG_INFO, "%s: OPT SYN\n", text);
-+					s->last_seq = sqn;
-+					s->last = sqn;
-+					s->oldest = sqn;
- 					break;
- 				case PGM_OPT_FIN:
- 					PULL(buf, fin);
-@@ -516,31 +518,32 @@ static void tsi_cmd(FILE *out, char *par
- 
- 				format_tsi(buf, &ps->tsi);
- 
--				fprintf(out, "%s: lead=%d trail=%d last=%d lastRepairData=%d oldest=%d\n",
-+				fprintf(out, "%s: lead=%d trail=%d last=%d lastRepairData=%d oldest=%d",
- 					buf, ps->lead, ps->trail, ps->last, ps->rlast, ps->oldest);
- 
- 				if (ps->dup)
--					fprintf(out, "Dup(OData!)=%u", ps->dup);
-+					fprintf(out, " dup(OData!)=%u", ps->dup);
- 
- 				if (ps->rdup)
--					fprintf(out, "Dup(Rdata!)=%u", ps->rdup);
-+					fprintf(out, " dup(Rdata!)=%u", ps->rdup);
- 
- 				if (ps->rdata)
--					fprintf(out, "rdata=%u", ps->rdata);
-+					fprintf(out, " rdata=%u", ps->rdata);
- 
- 				if (ps->ack)
--					fprintf(out, "ack=%u", ps->ack);
-+					fprintf(out, " ack=%u", ps->ack);
- 
- 				if (ps->nak)
--					fprintf(out, "nak=%u", ps->nak);
-+					fprintf(out, " nak=%u", ps->nak);
- 
- 				if (ps->first_sqn)
--					fprintf(out, "firstsqn=%u", ps->first_sqn);
-+					fprintf(out, " firstsqn=%u", ps->first_sqn);
- 
- 				if (ps->sqn_seq_errs) {
--					fprintf(out, "sqnerrs=%u lastmissed=%u nr_missed=%u",
-+					fprintf(out, " sqnerrs=%u lastmissed=%u nr_missed=%u",
- 						ps->sqn_seq_errs, ps->last_missed_sqn, ps->last_missed_sqns);
- 				}
-+				fprintf(out, "\n");
-   			}
- 			offset += nr;
- 		}
-Index: rdma-core/ib2roce/pgm.h
-===================================================================
---- rdma-core.orig/ib2roce/pgm.h
-+++ rdma-core/ib2roce/pgm.h
-@@ -40,11 +40,15 @@
- #include "channel.h"
- #include "multicast.h"
- #include "buffers.h"
-+#include "packet.h"
- 
- enum pgm_mode { pgm_off, pgm_strict, pgm_llm, pgm_passthrough, pgm_dlr, pgm_resend };
- 
- extern enum pgm_mode pgm_mode;
- 
-+
-+
-+
- bool pgm_process(struct rdma_channel *c, struct mc *m, struct buf *buf);
- 
- unsigned pgm_brief_stats(char *b, struct i2r_interface *i);

@@ -16,10 +16,11 @@ Index: rdma-core/ib2roce/ib2roce.c
 ===================================================================
 --- rdma-core.orig/ib2roce/ib2roce.c
 +++ rdma-core/ib2roce/ib2roce.c
-@@ -507,6 +507,7 @@ int main(int argc, char **argv)
+@@ -507,6 +507,8 @@ int main(int argc, char **argv)
  {
  	int ret = 0;
  
++	/* Init the scheduler */
 +	now = timestamp();
  	parse_options(argc, argv);
  

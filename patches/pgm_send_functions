@@ -1,0 +1,439 @@
+Index: rdma-core/ib2roce/buffers.h
+===================================================================
+--- rdma-core.orig/ib2roce/buffers.h
++++ rdma-core/ib2roce/buffers.h
+@@ -98,6 +98,9 @@ struct buf {
+ 			/* Structs pulled out of the frame */
+ 			struct ibv_grh grh;
+ 			struct iphdr ip;
++			/* structs for sender */
++			struct pgm_opt_length *option_length;
++			struct pgm_opt_header *lastopt;
+ 		};
+ 		uint8_t meta[META_SIZE];
+ 	};
+Index: rdma-core/ib2roce/pgm.c
+===================================================================
+--- rdma-core.orig/ib2roce/pgm.c
++++ rdma-core/ib2roce/pgm.c
+@@ -87,8 +87,8 @@ struct pgm_stream {
+ 	unsigned sqn_seq_errs;
+ 	unsigned drop;
+ 	unsigned last_missed_sqn, last_missed_sqns;
++	struct in_addr repairer;
+ 	enum stream_state state;
+-//	struct nak *nak;
+ 	char text[60];
+ };
+ 
+@@ -102,36 +102,6 @@ struct pgm_record {
+ 	unsigned len;			/* Length of the message */
+ };
+ 
+-#define MAX_PGM_TYPE (PGM_ACK + 1)
+-#define PGM_TYPE_MASK (PGM_OPT_VAR_PKTLEN -1)
+-#define MAX_PGM_OPT PGM_OPT_PGMCC_FEEDBACK
+-
+-/* There are 3 categories of pgm_data frames and one invalid. Encode them in a 64 bit integer */
+-#define PGM_CAT_SHIFT 16
+-
+-enum cat_type { cat_invalid, cat_spm, cat_data, cat_nak, pgm_cat_max };
+-
+-/* This mapping only works for IPv4 */
+-static const uint64_t cat_sizes =
+-	(sizeof(struct pgm_spm) << PGM_CAT_SHIFT) +
+-	(sizeof(struct pgm_data) << (2 * PGM_CAT_SHIFT)) +
+-	(sizeof(struct pgm_nak) << (3 * PGM_CAT_SHIFT));
+-
+-/* Mapping of PGM_TYPES to categories */
+-
+-/* 2 bits required for each entry in type_to_cat */
+-#define PGM_TYPE_SHIFT 2
+-
+-static const uint64_t type_to_cat = {
+-	cat_spm +					/* PGM_SPM	   = 0x00 */
+-        (cat_data << (4 * PGM_TYPE_SHIFT)) +		/* PGM_ODATA       = 0x04 */
+-        (cat_data << (5 * PGM_TYPE_SHIFT)) +		/* PGM_RDATA       = 0x05 */
+-        (cat_nak << (8 * PGM_TYPE_SHIFT)) +		/* PGM_NAK         = 0x08 */
+-        (cat_nak << (9 * PGM_TYPE_SHIFT)) +		/* PGM_NNAK        = 0x09 */
+-        (cat_nak << (10 * PGM_TYPE_SHIFT)) +		/* PGM_NCF         = 0x0a */
+-        (cat_nak << (13 * PGM_TYPE_SHIFT))		/* PGM_ACK         = 0x0d */
+-};
+-
+ /* Permissions for options indexed by category */
+ static const uint64_t cat_perm[pgm_cat_max] = {
+ 	/* Invalid */	0,
+@@ -196,12 +166,16 @@ static bool process_data(struct pgm_stre
+ 	if (sqn > s->lead)
+ 		s->lead = sqn;
+ 
+-	if (sqn != s->last +1) {
++	if (sqn != s->last +1 && !opt_offset[PGM_OPT_RST]) {
+ 		logg(LOG_NOTICE, "%s: Sequence error SQN %d->SQN %d diff %d\n", s->text, s->last, sqn, sqn - s->last);
+ 		s->state = stream_repair;
+ 		s->sqn_seq_errs++;
+ 	}
+ 
++	if (opt_offset[PGM_OPT_FIN])
++		/* End of Stream */
++		s->state = stream_init;
++
+ accept:
+ 	s->last = sqn;
+ 	return true;
+@@ -215,7 +189,11 @@ static bool process_spm(struct pgm_strea
+ 	s->trail = ntohl(spm->spm_trail);
+ 	s->lead = ntohl(spm->spm_lead);
+ 
+-	s->state = stream_sync;
++	if (opt_offset[PGM_OPT_SYN] || opt_offset[PGM_OPT_RST])
++		s->state = stream_init;
++	else
++		s->state = stream_sync;
++
+ 	return true;
+ }
+ 
+@@ -286,14 +264,14 @@ drop:
+ 
+ 	/* Determine the category of the pgm_type which will allow us to easily check allowed options */
+  	pgm_type = header->pgm_type & PGM_TYPE_MASK;
+-	pgm_category = (type_to_cat >> (pgm_type * PGM_TYPE_SHIFT)) & ((1 << PGM_TYPE_SHIFT) -1);
++	pgm_category = pgm_type2cat(pgm_type);
+ 	if (pgm_type >= MAX_PGM_TYPE || pgm_category == cat_invalid) {
+ 		logg(LOG_NOTICE, "%s: Invalid PGM type %u. Packet Skipped.\n", s->text, pgm_type);
+ 		goto drop;
+ 	}
+ 
+ 	/* move to the beginning of the options. Extracts size for category from cat_sizes */
+-	a = pgm_start + sizeof(struct pgm_header) + ((cat_sizes >> (pgm_category * PGM_CAT_SHIFT)) & ((1 << PGM_CAT_SHIFT) -1));
++	a = pgm_start + sizeof(struct pgm_header) + pgm_type2size(pgm_type);
+ 
+ 	/*
+ 	 * Parse options following the PGM header. This is common for all PGM packet types so do it
+Index: rdma-core/ib2roce/pgm.h
+===================================================================
+--- rdma-core.orig/ib2roce/pgm.h
++++ rdma-core/ib2roce/pgm.h
+@@ -48,4 +48,44 @@ bool pgm_process(struct rdma_channel *c,
+ 
+ unsigned pgm_brief_stats(char *b, struct i2r_interface *i);
+ 
++#define MAX_PGM_TYPE (PGM_ACK + 1)
++#define PGM_TYPE_MASK (PGM_OPT_VAR_PKTLEN -1)
++#define MAX_PGM_OPT PGM_OPT_PGMCC_FEEDBACK
++
++/* There are 3 categories of pgm_data frames and one invalid. Encode them in a 64 bit integer */
++#define PGM_CAT_SHIFT 16
++
++enum cat_type { cat_invalid, cat_spm, cat_data, cat_nak, pgm_cat_max };
++
++/* This mapping only works for IPv4 */
++static const uint64_t cat_sizes =
++	(sizeof(struct pgm_spm) << PGM_CAT_SHIFT) +
++	(sizeof(struct pgm_data) << (2 * PGM_CAT_SHIFT)) +
++	(sizeof(struct pgm_nak) << (3 * PGM_CAT_SHIFT));
++
++/* Mapping of PGM_TYPES to categories */
++
++/* 2 bits required for each entry in type_to_cat */
++#define PGM_TYPE_SHIFT 2
++
++static const uint64_t type_to_cat = {
++	cat_spm +					/* PGM_SPM	   = 0x00 */
++        (cat_data << (4 * PGM_TYPE_SHIFT)) +		/* PGM_ODATA       = 0x04 */
++        (cat_data << (5 * PGM_TYPE_SHIFT)) +		/* PGM_RDATA       = 0x05 */
++        (cat_nak << (8 * PGM_TYPE_SHIFT)) +		/* PGM_NAK         = 0x08 */
++        (cat_nak << (9 * PGM_TYPE_SHIFT)) +		/* PGM_NNAK        = 0x09 */
++        (cat_nak << (10 * PGM_TYPE_SHIFT)) +		/* PGM_NCF         = 0x0a */
++        (cat_nak << (13 * PGM_TYPE_SHIFT))		/* PGM_ACK         = 0x0d */
++};
++
++static inline enum cat_type pgm_type2cat(enum pgm_type_e ptype)
++{
++	return (type_to_cat >> (ptype * PGM_TYPE_SHIFT)) & ((1 << PGM_TYPE_SHIFT) -1);
++}
++
++static inline unsigned pgm_type2size(enum pgm_type_e ptype)
++{
++	return (cat_sizes >> (pgm_type2cat(ptype) * PGM_CAT_SHIFT)) & ((1 << PGM_CAT_SHIFT) -1);
++}
++
+ #endif
+Index: rdma-core/ib2roce/sender.c
+===================================================================
+--- rdma-core.orig/ib2roce/sender.c
++++ rdma-core/ib2roce/sender.c
+@@ -40,7 +40,7 @@
+ #include "interfaces.h"
+ #include "sender.h"
+ #include "cli.h"
+-#include "packet.h"
++#include "pgm.h"
+ 
+ static unsigned sendrate = 5;
+ static unsigned sendbatch = 1;
+@@ -48,7 +48,7 @@ static unsigned sendlen = 32;
+ 
+ static uint64_t sender_interval;
+ static uint64_t sender_time;
+-static unsigned sender_seq = 1;
++static unsigned sender_seq;
+ 
+ static unsigned sessionid;
+ static char hostname[40];
+@@ -64,31 +64,13 @@ struct sender_info {
+ 
+ #define SENDER_SIGNATURE 0xD3ADB33F
+ 
+-/*
+-static void send_data(struct mc *, struct buf *buf, int resend)
+-{
+-}
+-
+-static void receive_data(struct mc *, struct buf *buf)
+-{
+-}
+ 
+-static void send_ack(struct mc *i)
+-{
+-}
+-
+-static void send_nak(struct mc *i)
+-{
+-}
+-
+-*/
+-static void prep_sender_struct(struct i2r_interface *i, struct buf *buf, struct mc *m)
++/* Return pointer to spm_type specific data */
++static void *pgm_packet_start(struct i2r_interface *i, struct buf *buf, struct mc *m, enum pgm_type_e ptype)
+ {
+ 	struct pgm_header *h;
+-	struct pgm_data *d;
+ 	struct pgm_opt_length *ol;
+-	struct sender_info *s;
+-	bool last_opt;
++	void *type_data;
+ 
+ 	buf->end = buf->raw;
+ 
+@@ -99,53 +81,115 @@ static void prep_sender_struct(struct i2
+ 
+ 	memset(buf->raw, 0, sendlen);
+ 
++	/* Create the pgm header */
+ 	VPUSH(buf, h);
+ 
+ 	h->pgm_sport = htons(i->port);
+ 	h->pgm_dport = htons(m->port);
+-	h->pgm_type = PGM_ODATA;
++	h->pgm_type = ptype;
+ 	h->pgm_options = PGM_OPT_PRESENT;
+ 	h->pgm_checksum = 0;
+ 	memcpy(h->pgm_gsi, &i->if_addr.sin_addr, sizeof(i->if_addr.sin_addr));
+ 	memcpy(h->pgm_gsi + 4, &i->if_addr.sin_port, sizeof(i->if_addr.sin_port));
+ 
+-	VPUSH(buf, d);
+-	d->data_sqn = htonl(sender_seq);
+-	d->data_trail = htonl(sender_seq);
++	type_data = buf->end;
++	/* Space for the type specific struct */
++	buf->end += pgm_type2size(ptype);
+ 
+ 	VPUSH(buf, ol);
+ 
+-	last_opt = sender_seq > 1;
+-
+ 	/* Options follow opt_length is needed */
+ 	ol->opt_type = PGM_OPT_LENGTH;
+-        if (last_opt)
+-		ol->opt_type |= PGM_OPT_END;
+-
+ 	ol->opt_length = sizeof(struct pgm_opt_length);
+ 
+-	if (sender_seq == 1) {
+-		struct pgm_opt_header *poh;
+-		struct pgm_opt_syn *pos;
+-
+-		VPUSH(buf, poh);
+-		poh->opt_type = PGM_OPT_SYN | PGM_OPT_END;
+-		poh->opt_reserved = 0;
++	buf->option_length = ol;
++	return type_data;
++}
+ 
+-		VPUSH(buf, pos);
+-		pos->opt_reserved = 0;
+ 
+-		poh->opt_length = buf->end - (uint8_t *)poh;
++/* Returns pointer to where the option data has to be placed */
++static void *pgm_option(struct buf *buf, uint8_t opt_type, unsigned len)
++{
++	struct pgm_opt_header *poh;
++	void *option_data;
+ 
+-	}
++	buf->lastopt = (void *)buf->end;
++
++	VPUSH(buf, poh);
++	poh->opt_type = opt_type;
++	poh->opt_reserved = 0;
++
++	option_data = buf->end;
++	buf->end += len;
++	poh->opt_length = buf->end - (uint8_t *)poh;
++
++	return option_data;
++
++}
++
++static void pgm_end_options(struct buf *buf)
++{
++	buf->lastopt->opt_type |= PGM_OPT_END;
++	buf->option_length->opt_total_length = htons(buf->end - (uint8_t *)buf->option_length);
++
++}
+ 
+ /*
+-	Missing
+-       	OPT_FIN in last packet
+- 	OPT_RST for unrecoverable error
+-*/
++ * After all data has been written to the buffer finish it up
++ * setting maximum length etc.
++ */
++static void pgm_packet_end(struct buf *buf)
++{
++	struct pgm_header *h = (void *)buf->raw;
++
++	/* RFC3208 8. Packet formats */
++	h->pgm_tsdu_length = htons(buf->end - buf->raw - sizeof(struct pgm_header));
++
++	/* Stuff it if sendlen is defined so that we send packets of a fixed size */
++	if (buf->end < buf->raw + sendlen)
++		buf->end = buf->raw +sendlen;
++}
++
+ 
+-	ol->opt_total_length = htons(buf->end - (uint8_t *)ol);
++static void prep_spm(struct i2r_interface *i, struct buf *buf, struct mc *m, uint8_t ptype)
++{
++	struct pgm_spm *ps = pgm_packet_start(i, buf, m, PGM_SPM);
++
++	ps->spm_sqn = 1;
++	ps->spm_trail = 1;
++	ps->spm_lead = 1;
++	ps->spm_nla_afi = 4;
++	ps->spm_nla = i->if_addr.sin_addr;
++
++	pgm_option(buf, ptype, 0);
++
++	pgm_end_options(buf);
++	pgm_packet_end(buf);
++}
++
++static void prep_sender_struct(struct i2r_interface *i, struct buf *buf, struct mc *m)
++{
++	struct sender_info *s;
++	struct pgm_data *d;
++
++	/* Max MTU is 4096 bytes */
++	if (sendlen > 4096)
++		abort();
++
++	buf->end = buf->raw;
++	memset(buf->raw, 0, sendlen);
++
++	d = pgm_packet_start(i, buf, m, PGM_ODATA);
++	d->data_sqn = htonl(sender_seq);
++	d->data_trail = htonl(sender_seq);
++
++	if (sender_seq  <= 1) {
++		struct pgm_opt_syn *pos = pgm_option(buf, PGM_OPT_SYN, sizeof(struct pgm_opt_syn));
++
++		pos->opt_reserved = 0;
++	}
++
++	pgm_end_options(buf);
+ 
+ 	VPUSH(buf, s);
+ 	s->signature = SENDER_SIGNATURE;
+@@ -154,12 +198,7 @@ static void prep_sender_struct(struct i2
+ 
+ 	s->timestamp = now;
+ 
+-	/* RFC3208 8. Packet formats */
+-	h->pgm_tsdu_length = htons(buf->end - buf->raw - sizeof(struct pgm_header));
+-
+-	/* Stuff it if sendlen is defined */
+-	if (buf->end < buf->raw + sendlen)
+-		buf->end = buf->raw +sendlen;
++	pgm_packet_end(buf);
+ }
+ 
+ static void sender_send(void *private)
+@@ -222,16 +261,37 @@ out:
+ 
+ void sender_shutdown(void)
+ {
+-	if (sender_interval) {
+-		sender_interval = 0;
+-		sender_send(NULL);		/* Argh... Race condition */
++	struct i2r_interface *i = i2r + default_interface;
++
++	if (!sender_interval)
++		return;
++
++	sender_interval = 0;
++	sender_send(NULL);		/* Argh... Race condition */
++
++	/* scan through all multicast groups and send SPMs */
++	mc_foreach(m) {
++		struct rdma_channel *c = m->interface[default_interface].channel;
++		struct buf *buf;
++
++		if (m->interface[default_interface].status != MC_JOINED)
++			continue;
++
++		buf = alloc_buffer(c);
++		prep_spm(i, buf, m, PGM_OPT_FIN);
++		__send_to(c, buf->raw, buf->end - buf->raw, &m->interface[default_interface].ai, false, 0, buf);
+ 	}
++	sender_seq = 0;
++	sleep(10);
+ }
+ 
+ static void __sender_setup(void *private)
+ {
++	struct i2r_interface *i = i2r + default_interface;
+ 	unsigned r;
+ 
++	sender_shutdown();
++
+ 	if (sendrate < 300) {
+ 		r = sendrate;
+  		sendbatch = 1;
+@@ -250,7 +310,23 @@ static void __sender_setup(void *private
+ 	}
+ 
+ 	sender_interval = ONE_SECOND / r;
++
+ 	logg(LOG_DEBUG, "Rate = %u. Batch=%u Sendrate=%u interval=%s rate*sendbatch=%u\n", sendrate, sendbatch, r, print_time(sender_interval), r * sendbatch);
++
++	sender_seq = 1;
++
++	/* scan through all multicast groups and send SPMs */
++	mc_foreach(m) {
++		struct rdma_channel *c = m->interface[default_interface].channel;
++		struct buf *buf;
++
++		if (m->interface[default_interface].status != MC_JOINED)
++			continue;
++
++		buf = alloc_buffer(c);
++		prep_spm(i, buf, m, PGM_OPT_SYN);
++		__send_to(c, buf->raw, buf->end - buf->raw, &m->interface[default_interface].ai, false, 0, buf);
++	}
+ }
+ 
+ void sender_setup(void)

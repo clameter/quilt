@@ -1,0 +1,33 @@
+Index: rdma-core/ib2roce/sched.c
+===================================================================
+--- rdma-core.orig/ib2roce/sched.c
++++ rdma-core/ib2roce/sched.c
+@@ -214,17 +214,24 @@ void add_event(uint64_t time, event_call
+  */
+ uint64_t run_events(void)
+ {
++	uint64_t start;
+ 	while (next_event) {
+ 		struct timed_event *te = next_event;
+ 
+-		now = timestamp();
++		now = start = timestamp();
+ 
+-		if (te->time > now + ONE_MICROSECOND)
+-			return te->time - now;
++		if (te->time > now + seconds(60)) {
++			logg(LOG_ERR, "Event \'%s\' too far in the future (now=%lx event=%lx. Running it now.\n", te->text, now, te->time);
++		} else {
++			if (te->time > now + ONE_MICROSECOND)
++				return te->time - now;
++		}
+ 
+-		/* Time is up for an event */
+ 		next_event = te->next;
+ 		te->callback(te->private);
++		now = timestamp();
++		if (now > start + milliseconds(100))
++			logg(LOG_WARNING, "Event \'%s'\' ran for %s. Maximum is 100 ms\n", te->text, print_time(now - start));
+ 		free(te);
+ 	}
+ 	return 0;

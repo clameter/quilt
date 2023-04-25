@@ -160,7 +160,7 @@ Index: rdma-core/ib2roce/pgm.c
 -
 -			logg(LOG_NOTICE, "%s: New Stream TSI %s\n", i->text, s->text);
 +			if (!valid_addr(c->i, tsi.sender)) {
-+				s->enabled = false;
++				m->enabled = false;
 +				logg(LOG_NOTICE, "%s: New Stream TSI %s (Source addr not on valid add. Traffic will be dropped)\n", i->text, s->text);
 +			} else
 +				logg(LOG_NOTICE, "%s: New Stream TSI %s\n", i->text, s->text);
@@ -223,3 +223,29 @@ Index: rdma-core/ib2roce/ib2roce.c
  		return;
  
  success:
+Index: rdma-core/ib2roce/multicast.h
+===================================================================
+--- rdma-core.orig/ib2roce/multicast.h
++++ rdma-core/ib2roce/multicast.h
+@@ -94,6 +94,8 @@ struct mc_interface {
+ 	unsigned long delayed;		/* Packets delayed */
+ };
+ 
++#define MGID_MODE_CLLM 4
++
+ struct mc {
+ 	struct in_addr addr;
+ 	struct mc_interface interface[NR_INTERFACES];
+Index: rdma-core/ib2roce/logging.c
+===================================================================
+--- rdma-core.orig/ib2roce/logging.c
++++ rdma-core/ib2roce/logging.c
+@@ -220,7 +220,7 @@ void brief_status(FILE *out)
+ 		if (i->mc_rate_limited)
+ 			n+= sprintf(counts + n, " R%d", i->mc_rate_limited);
+ 
+-		if (pgm_mode != pgm_off)
++		if (pgm_mode)
+ 			n += pgm_brief_stats(counts + n, i);
+ 
+ 		if (sum_stats(stats, i, channel_ud) && stats[packets_received]) {

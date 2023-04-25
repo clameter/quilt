@@ -1,79 +1,234 @@
-diff --git a/ib2roce/logging.c b/ib2roce/logging.c
-index 703f6335..24ac8a3c 100644
---- a/ib2roce/logging.c
-+++ b/ib2roce/logging.c
-@@ -202,7 +202,7 @@ void brief_status(FILE *out)
- 	if (n == 0) {
- 		events = "No upcoming events";
- 	} else {
--		snprintf(buf2, sizeof(buf2), "Events in %s", buf);
-+		snprintf(buf2, sizeof(buf2), "Events: %s", buf);
- 		events = buf2;
+diff --git a/ib2roce/pgm.c b/ib2roce/pgm.c
+index 797fd6cb..66650a2b 100644
+--- a/ib2roce/pgm.c
++++ b/ib2roce/pgm.c
+@@ -203,8 +203,8 @@ static bool process_data(struct pgm_stream *s, struct pgm_header *h, uint16_t *o
+ {
+ 	struct pgm_data *data = (struct pgm_data *)(h + 1);
+ //	uint32_t tdsu = ntohs(h->pgm_tsdu_length);
+-	uint32_t sqn = ntohl(data->data_sqn);
+-	uint32_t trail = ntohl(data->data_trail);
++	uint32_t sqn = ntohl(data->pgmd_seq);
++	uint32_t trail = ntohl(data->pgmd_trailseq);
+ 
+ 	logg(LOG_DEBUG, "%s: %s SQN=%d TRAIL=%d SYN=%d len=%u\n", s->text, pgm_type_text[h->pgm_type], sqn, trail, opt_offset[PGM_OPT_SYN], len);
+ 
+@@ -272,12 +272,12 @@ static bool process_spm(struct pgm_stream *s, struct pgm_header *h,
+ 	unsigned sqn;
+ 
+ 	logg(LOG_DEBUG, "%s: SPM SPMSQN=%d LEAD=%u TRAIL=%u FIN=%u RST=%u\n",
+-		s->text, ntohl(spm->spm_sqn), ntohl(spm->spm_lead), ntohl(spm->spm_trail), opt_offset[PGM_OPT_FIN], opt_offset[PGM_OPT_RST]);
++		s->text, ntohl(spm->pgms_seq), ntohl(spm->pgms_leadseq), ntohl(spm->pgms_trailseq), opt_offset[PGM_OPT_FIN], opt_offset[PGM_OPT_RST]);
+ 
+ 	s->spm++;
+ 
+-	if (ntohs(spm->spm_nla_afi) != AFI_IP) {
+-		logg(LOG_INFO, "Unsupported AFI (%u) on SPM %s\n", ntohs(spm->spm_nla_afi), s->text);
++	if (ntohs(spm->pgms_nla_afi) != AFI_IP) {
++		logg(LOG_INFO, "Unsupported AFI (%u) on SPM %s\n", ntohs(spm->pgms_nla_afi), s->text);
+ spm_error:
+ 		s->spm_errors++;
+ 		return true;
+@@ -296,7 +296,7 @@ spm_error:
+ 		return true;
  	}
  
-@@ -237,9 +237,9 @@ void brief_status(FILE *out)
+-	sqn = ntohl(spm->spm_sqn);
++	sqn = ntohl(spm->pgms_seq);
+ 
+ 	if (s->spm_sqn && s->state == stream_sync && sqn <= s->spm_sqn) {
+ 		/* Outdated SPM */
+@@ -306,11 +306,11 @@ spm_error:
+ 
+ 	s->state = stream_sync;
+ 	s->spm_sqn = sqn;
+-	s->trail = ntohl(spm->spm_trail);
+-	s->lead = ntohl(spm->spm_lead);
+-	s->nak_nla = spm->spm_nla;
++	s->trail = ntohl(spm->pgms_trailseq);
++	s->lead = ntohl(spm->pgms_leadseq);
++	s->nak_nla = spm->pgms_nla;
+ 	if (pgm_nak) {
+-		spm->spm_nla = c->destination->i->if_addr.sin_addr;
++		spm->pgms_nla = c->destination->i->if_addr.sin_addr;
  	}
- 
- 	if (out == stdout)
--		logg(LOG_NOTICE, "%s. Groups=%d/%d. Packets=%s\n", events, active_mc, nr_mc, counts);
-+		logg(LOG_NOTICE, "%s. Groups=%d/%d. Packets=%s", events, active_mc, nr_mc, counts);
- 	else
--		fprintf(out, "%s. Groups=%d/%d. Packets=%s\n", events, active_mc, nr_mc, counts);
-+		fprintf(out, "%s. Groups=%d/%d. Packets=%s", events, active_mc, nr_mc, counts);
- 
- #ifdef UNICAST
- 	list_endpoints(i2r + INFINIBAND);
-@@ -312,6 +312,11 @@ static void systemd_set(char *optarg)
- 	systemd = true;
+ 	return true;
  }
- 
-+static void continous_set(char *optarg)
-+{
-+	continous_cmd(stdout, optarg);
-+}
-+
- __attribute__((constructor))
- static void logging_init(void)
+@@ -319,7 +319,7 @@ spm_error:
+ static bool process_nak(struct pgm_stream *s, struct pgm_header *h, uint16_t *opt_offset)
  {
-@@ -321,5 +326,6 @@ static void logging_init(void)
- 		"Log output to console (0=EMERG, 1=ALERT, 2=CRIT, 3=ERR, 4=WARN, 5=NOTICE, 6=INFO, 7=DEBUG)");
- 	register_option("verbose", no_argument, 'v', verbose_set, NULL, "Increase logging detail");
- 	register_option("systemd", no_argument, 's', systemd_set, NULL, "Operate from systemd");
-+	register_option("continous", required_argument, '@', continous_set, NULL, "Print continuous status");
+ 	struct pgm_nak *nak = (struct pgm_nak *)(h + 1);
+-	uint32_t sqn = ntohl(nak->nak_sqn);
++	uint32_t sqn = ntohl(nak->pgmn_seq);
+ 	unsigned count = 1;
+ 	unsigned n;
+ 	char sqns[2000];
+@@ -346,12 +346,12 @@ static bool process_nak(struct pgm_stream *s, struct pgm_header *h, uint16_t *op
+ 		switch (h->pgm_type) {
+ 			case PGM_NAK: s->nak += count; break;
+ 			case PGM_NCF: s->ncf += count; break;
+-			case PGM_NNAK: s->nnak += count; break;
++			case PGM_NULLNAK: s->nnak += count; break;
+ 		}
+ 
+ 		logg(LOG_DEBUG, "%s: %s NLA=%s GRP_NLA=%s SQN=%s\n",
+-			s->text, pgm_type_text[h->pgm_type], inet_ntoa(nak->nak_src_nla),
+-			inet_ntoa(nak->nak_grp_nla), sqns);
++			s->text, pgm_type_text[h->pgm_type], inet_ntoa(nak->pgmn_src_nla),
++			inet_ntoa(nak->pgmn_grp_nla), sqns);
+ 
+ 		s->timestamp_error = now;
+ 
+@@ -393,8 +393,6 @@ static struct pgm_stream *create_tsi(struct rdma_channel *c, struct pgm_tsi *tsi
+ 	return s;
  }
  
-diff --git a/ib2roce/sched.c b/ib2roce/sched.c
-index 3d57e160..f435a847 100644
---- a/ib2roce/sched.c
-+++ b/ib2roce/sched.c
-@@ -142,13 +142,29 @@ int64_t time_to_next_event(void)
- 		return 0;
- }
+-
+-
+ /*
+  * Parse PGM headers and options. Return address of subheader and the options in the array
+  * Returns the catory of the pgm record
+@@ -421,7 +419,7 @@ static enum cat_type parse_pgm(struct pgm_stream *s, struct pgm_header *h, bool
+ 	 */
+ 	memset(opt_offset, 0, sizeof(uint16_t) * MAX_PGM_OPT);
  
-+static char *print_time(uint64_t time)
-+{
-+	static char buf[20];
-+
-+	if (time > 10 * ONE_SECOND)
-+		sprintf(buf, "%lds", (time + ONE_SECOND /2 ) / ONE_SECOND);
-+	else if (time > 10 * ONE_MILLISECOND)
-+		sprintf(buf, "%ldms", (time + ONE_MICROSECOND / 2 ) /ONE_MILLISECOND);
-+	else if (time > 10 * ONE_MICROSECOND)
-+		sprintf(buf, "%ldus", (time + ONE_MICROSECOND / 2 )/ ONE_MICROSECOND);
-+	else
-+		sprintf(buf, "%ldns", time);
-+
-+	return buf;
-+}
-+
- int get_timer_list(char *buf, char separator)
+-	if (h->pgm_options & PGM_OPT_PRESENT) {
++	if (h->pgm_options & PGM_OPT_BIT_PRESENT) {
+ 
+ 		struct pgm_opt_header *poh;
+ 		uint8_t *opt_start =  a;
+@@ -522,8 +520,8 @@ bool pgm_process_unicast(struct rdma_channel *c, struct buf *buf)
+ 		return false;
+ 
+ 	/* NAK specific */
+-	tsi.mcgroup = nak->nak_src_nla;
+-	memcpy(tsi.gsi, header->pgm_gsi, 6);
++	tsi.mcgroup = nak->pgmn_nak_src_nla;
++	memcpy(tsi.gsi, header->pgm_gsid, 6);
+ 	memcpy(&tsi.flow, &header->pgm_dport, sizeof(uint16_t));
+ 
+ 	s = hash_find(i->pgm_tsi_hash, &tsi);
+@@ -554,7 +552,7 @@ bool pgm_process_multicast(struct rdma_channel *c, struct mc *m, struct buf *buf
+ 
+ 	/* This is not going to work for NAKs */
+ 	tsi.mcgroup = m->addr;
+-	memcpy(tsi.gsi, header->pgm_gsi, 6);
++	memcpy(tsi.gsi, header->pgm_gsid, 6);
+ 	memcpy(&tsi.flow, &header->pgm_sport, sizeof(uint16_t));
+ 
+ 	s = hash_find(i->pgm_tsi_hash, &tsi);
+diff --git a/ib2roce/pgm.h b/ib2roce/pgm.h
+index 74e39ea2..7fe7f763 100644
+--- a/ib2roce/pgm.h
++++ b/ib2roce/pgm.h
+@@ -40,7 +40,7 @@
+ #include "channel.h"
+ #include "multicast.h"
+ #include "buffers.h"
+-#include "packet.h"
++#include "pgm-defs.h"
+ 
+ extern bool pgm_mode;
+ 
+@@ -72,7 +72,7 @@ static const uint64_t cat_sizes =
+ static const uint64_t type_to_cat_uc_mc[2] = {
+ 	/* Unicast */
+         (cat_nak << (8 * PGM_TYPE_SHIFT)) +		/* PGM_NAK         = 0x08 */
+-        (cat_nak << (9 * PGM_TYPE_SHIFT)) +		/* PGM_NNAK        = 0x09 */
++        (cat_nak << (9 * PGM_TYPE_SHIFT)) +		/* PGM_NULLNAK     = 0x09 */
+         (cat_nak << (13 * PGM_TYPE_SHIFT))		/* PGM_ACK         = 0x0d */,
+ 
+ 	/* Multicast */
+@@ -88,23 +88,23 @@ static const uint64_t type_to_cat = {
+         (cat_data << (4 * PGM_TYPE_SHIFT)) +		/* PGM_ODATA       = 0x04 */
+         (cat_data << (5 * PGM_TYPE_SHIFT)) +		/* PGM_RDATA       = 0x05 */
+         (cat_nak << (8 * PGM_TYPE_SHIFT)) +		/* PGM_NAK         = 0x08 */
+-        (cat_nak << (9 * PGM_TYPE_SHIFT)) +		/* PGM_NNAK        = 0x09 */
++        (cat_nak << (9 * PGM_TYPE_SHIFT)) +		/* PGM_NULLNAK     = 0x09 */
+         (cat_nak << (10 * PGM_TYPE_SHIFT)) +		/* PGM_NCF         = 0x0a */
+         (cat_nak << (13 * PGM_TYPE_SHIFT))		/* PGM_ACK         = 0x0d */
+ };
+ 
+ 
+-static inline enum cat_type __pgm_type2cat(uint64_t mask, enum pgm_type_e ptype)
++static inline enum cat_type __pgm_type2cat(uint64_t mask, enum _pgm_type ptype)
  {
- 	int n = 0;
- 
- 	now = timestamp();
- 	for(struct timed_event *z = next_event; z; z = z->next)
--		n += sprintf(buf + n, "%ldms%c", z->time > now ? (z->time - now) / ONE_MILLISECOND : 0,  separator);
-+		n += sprintf(buf + n, "%s(%s)%c", z->text, print_time(z->time > now ? (z->time - now) : 0),  separator);
- 
- 	return n;
+ 	return (mask >> (ptype * PGM_TYPE_SHIFT)) & ((1 << PGM_TYPE_SHIFT) -1);
  }
+ 
+-static inline enum cat_type pgm_type2cat(enum pgm_type_e ptype, bool multicast)
++static inline enum cat_type pgm_type2cat(enum _pgm_type ptype, bool multicast)
+ {
+ 	return __pgm_type2cat(type_to_cat_uc_mc[multicast], ptype);
+ }
+ 
+-static inline unsigned pgm_type2size(enum pgm_type_e ptype)
++static inline unsigned pgm_type2size(enum _pgm_type ptype)
+ {
+ 	return (cat_sizes >> (__pgm_type2cat(type_to_cat, ptype) * PGM_CAT_SHIFT)) & ((1 << PGM_CAT_SHIFT) -1);
+ }
+diff --git a/ib2roce/sender.c b/ib2roce/sender.c
+index 9a8c68cb..b42ff3d5 100644
+--- a/ib2roce/sender.c
++++ b/ib2roce/sender.c
+@@ -71,7 +71,7 @@ struct sender_info {
+ 
+ 
+ /* Return pointer to spm_type specific data */
+-static void *pgm_packet_start(struct i2r_interface *i, struct buf *buf, struct mc *m, enum pgm_type_e ptype)
++static void *pgm_packet_start(struct i2r_interface *i, struct buf *buf, struct mc *m, enum _pgm_type ptype)
+ {
+ 	struct pgm_header *h;
+ 	struct pgm_opt_length *ol;
+@@ -92,10 +92,10 @@ static void *pgm_packet_start(struct i2r_interface *i, struct buf *buf, struct m
+ 	h->pgm_sport = htons(0xaaaa);
+ 	h->pgm_dport = htons(m->port);
+ 	h->pgm_type = ptype;
+-	h->pgm_options = PGM_OPT_PRESENT;
+-	h->pgm_checksum = 0;
+-	memcpy(h->pgm_gsi, &i->if_addr.sin_addr, sizeof(i->if_addr.sin_addr));
+-	memcpy(h->pgm_gsi + 4, &i->if_addr.sin_port, sizeof(i->if_addr.sin_port));
++	h->pgm_options = PGM_OPT_BIT_PRESENT;
++	h->pgm_sum = 0;
++	memcpy(h->pgm_gsid, &i->if_addr.sin_addr, sizeof(i->if_addr.sin_addr));
++	memcpy(h->pgm_gsid + 4, &i->if_addr.sin_port, sizeof(i->if_addr.sin_port));
+ 
+ 	type_data = buf->end;
+ 	/* Space for the type specific struct */
+@@ -149,7 +149,7 @@ static void pgm_packet_end(struct buf *buf)
+ 	struct pgm_header *h = (void *)buf->raw;
+ 
+ 	/* RFC3208 8. Packet formats */
+-	h->pgm_tsdu_length = htons(buf->end - buf->raw - sizeof(struct pgm_header));
++	h->pgm_length = htons(buf->end - buf->raw - sizeof(struct pgm_header));
+ 
+ 	/* Stuff it if sendlen is defined so that we send packets of a fixed size */
+ 	if (buf->end < buf->raw + sendlen) {
+@@ -162,11 +162,11 @@ static void prep_spm(struct i2r_interface *i, struct buf *buf, struct mc *m, uin
+ 	struct pgm_spm *ps = pgm_packet_start(i, buf, m, PGM_SPM);
+ 	char *p;
+ 
+-	ps->spm_sqn = htonl(spm_seq);
+-	ps->spm_trail = htonl(sender_seq);
+-	ps->spm_lead = htonl(sender_seq);
+-	ps->spm_nla_afi = htons(AFI_IP);
+-	ps->spm_nla = i->if_addr.sin_addr;
++	ps->pgms_seq = htonl(spm_seq);
++	ps->pgms_trailseq = htonl(sender_seq);
++	ps->pgms_leadseq = htonl(sender_seq);
++	ps->pgms_nla_afi = htons(AFI_IP);
++	ps->pgms_nla = i->if_addr.sin_addr;
+ 
+ 	if (ptype)
+ 		pgm_option(buf, ptype, 0);
+@@ -192,8 +192,8 @@ static void prep_sender_struct(struct i2r_interface *i, struct buf *buf, struct
+ 	memset(buf->raw, 0, sendlen);
+ 
+ 	d = pgm_packet_start(i, buf, m, PGM_ODATA);
+-	d->data_sqn = htonl(sender_seq);
+-	d->data_trail = htonl(sender_seq);
++	d->pgmd_seq = htonl(sender_seq);
++	d->pgmd_trailseq = htonl(sender_seq);
+ 
+ 	if (sender_seq  <= 1) {
+ 		struct pgm_opt_syn *pos = pgm_option(buf, PGM_OPT_SYN, sizeof(struct pgm_opt_syn));
